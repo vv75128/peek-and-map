@@ -24,6 +24,9 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
   private _peekView?: PeekViewProvider;
   private _viewMode: 'tree' | 'graph';
   private _graphDirection: 'up' | 'down' | 'left' | 'right';
+  private _activeInstanceId: string = MapViewProvider.DEFAULT_INSTANCE_ID;
+  private _autoAnalyzeTimer?: NodeJS.Timeout;
+  private _isLocked = false;
 
   constructor(
     private readonly _extensionUri: vscode.Uri,
@@ -160,6 +163,16 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
           });
           break;
 
+        case 'activeInstanceChanged':
+          this._activeInstanceId = this._normalizeInstanceId(msg.instanceId);
+          break;
+
+        case 'toggleLock': {
+          this._isLocked = Boolean(msg.locked);
+          webviewView.webview.postMessage({ type: 'lockState', locked: this._isLocked });
+          break;
+        }
+
         case 'search':
           await this._doSearch(
             this._normalizeInstanceId(msg.instanceId),
@@ -269,6 +282,21 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
         }
       }
     });
+    // ── 鼠标点击变量/函数时自动更新 Map ──────────────────────────────
+    vscode.window.onDidChangeTextEditorSelection(async (e) => {
+      if (!this._view || !this._view.visible) { return; }
+      if (this._isLocked) { return; }
+      if (e.kind !== vscode.TextEditorSelectionChangeKind.Mouse) { return; }
+      const sel = e.selections[0];
+      if (!sel || !sel.isEmpty) { return; }
+      const wordRange = e.textEditor.document.getWordRangeAtPosition(sel.active);
+      if (!wordRange) { return; }
+
+      if (this._autoAnalyzeTimer) { clearTimeout(this._autoAnalyzeTimer); }
+      this._autoAnalyzeTimer = setTimeout(async () => {
+        await this._doSearch(this._activeInstanceId, '', '');
+      }, 300);
+    });
   }
 
   // ── Node ID allocation ─────────────────────────────────────────────────────
@@ -329,7 +357,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
 
     // ── References hierarchy (first level) ─────────────────────────────────
-    const refNodes = await this._resolveReferencingSymbols(session, doc.uri, queryPos, wsRoot);
+    const refNodes = await this._resolveReferencingSymbols(session, doc.uri, queryPos, wsRoot, word);
 
     // Resolve current symbol + optional owning class for root label/kind
     let rootKind = '';
@@ -415,6 +443,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     uri: vscode.Uri,
     pos: vscode.Position,
     wsRoot: string,
+    word: string,
     ancestorPathSymbolKeys: Set<string> = new Set<string>()
   ): Promise<TreeNodeData[]> {
     let locs: vscode.Location[] | undefined;
@@ -449,9 +478,14 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       )
       : undefined;
     const targetSimpleName = targetSymbol ? this._simpleSymbolName(targetSymbol.name) : '';
-    const targetKey = this._symbolPositionKey(uri, targetSymStart ?? pos);
-    const pathSymbolKeys = new Set<string>(ancestorPathSymbolKeys);
-    pathSymbolKeys.add(targetKey);
+    const targetIsFunction = !!targetSymbol && this._isFunctionLikeSymbol(targetSymbol.kind);
+    // 只有 targetSymbol 确实是查询的符号时，才把它加入 pathSymbolKeys
+	const targetMatchesWord = targetSimpleName === word;
+	const pathSymbolKeys = new Set<string>(ancestorPathSymbolKeys);
+	if (targetIsFunction && targetMatchesWord) {
+	  const targetKey = this._symbolPositionKey(uri, targetSymStart ?? pos);
+	  pathSymbolKeys.add(targetKey);
+	}
 
     const result: TreeNodeData[] = [];
     // Tracks which enclosing symbols have already received an expandable nodeId
@@ -489,7 +523,10 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
 
       // Skip self-reference: enclosing symbol IS the queried symbol itself
       const symStart = enclosing.selectionRange.start;
+      // 自引用跳过：只有 targetSymbol 名字匹配、且是函数时才跳过
       if (
+        targetIsFunction &&
+        targetMatchesWord &&
         loc.uri.toString() === uri.toString() &&
         targetSymStart &&
         symStart.line === targetSymStart.line &&
@@ -523,9 +560,14 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
 
       // First occurrence of this enclosing symbol → expandable; subsequent → leaf
       const symKey = loc.uri.toString() + '#sym:' + symStart.line + ':' + symStart.character;
-      if (pathSymbolKeys.has(symKey)) {
+      // 路径循环：只在 targetSymbol 匹配 word 时才启用
+      const isCurrentFunction = targetSymStart &&
+        symStart.line === targetSymStart.line &&
+        symStart.character === targetSymStart.character;
+      if (targetIsFunction && targetMatchesWord && !isCurrentFunction && pathSymbolKeys.has(symKey)) {
         continue;
       }
+	  
       const isFirst = !firstSeenKeys.has(symKey);
       if (isFirst) { firstSeenKeys.add(symKey); }
 
@@ -567,6 +609,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       info.uri,
       info.position,
       wsRoot,
+      '',
       new Set<string>(info.pathSymbolKeys)
     );
     this._view.webview.postMessage({ type: 'children', instanceId, parentNodeId: nodeId, items: children });
@@ -1411,6 +1454,29 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       display: block;
       background: inherit;
     }
+    .nav-btn {
+      cursor: pointer;
+      padding: 2px 4px;
+      font-size: 14px;
+      background: transparent;
+      color: var(--vscode-foreground, #ccc);
+      border: none;
+      border-radius: 3px;
+      flex-shrink: 0;
+      line-height: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 22px;
+      height: 22px;
+    }
+    .nav-btn:hover {
+      background: var(--vscode-toolbar-hoverBackground, rgba(90,93,94,0.31));
+    }
+    .nav-btn.active {
+      color: var(--vscode-button-foreground, #fff);
+      background: var(--vscode-button-background, #0e639c);
+    }
   </style>
   <!-- Dynamic theme symbol-kind colors (updated via postMessage on theme change) -->
   <style id="theme-tokens">${initialThemeCss}</style>
@@ -1423,6 +1489,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       <div id="instance-tabs" role="tablist" aria-label="Reference analysis instances"></div>
     </div>
     <div id="header">
+      <button id="lock-btn" class="nav-btn" title="锁定：忽略鼠标点击的自动更新">🔓</button>
       <button id="search-btn" title="Analyze symbol at cursor"><span class="btn-icon">🔍</span> Analysis</button>
       <div id="view-tabs" role="tablist" aria-label="Map View Mode">
         <button id="view-tab-tree" class="view-tab active" role="tab" aria-selected="true" title="Outline view">Outline</button>
@@ -1528,6 +1595,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     const copyRelativePathMenuItem = nodeContextMenu.querySelector('[data-action="copy-relative-path"]');
     const copyAbsolutePathMenuItem = nodeContextMenu.querySelector('[data-action="copy-absolute-path"]');
     const searchBtn    = paneRoot.querySelector('#search-btn');
+    const lockBtn      = paneRoot.querySelector('#lock-btn');
     const fileFiltersToggle = paneRoot.querySelector('#file-filters-toggle');
     const viewTabTree  = paneRoot.querySelector('#view-tab-tree');
     const viewTabGraph = paneRoot.querySelector('#view-tab-graph');
@@ -1766,6 +1834,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       bindInstanceState(next);
       renderInstanceTabs();
       applyActiveStateUi();
+      vscodeApi.postMessage({ type: 'activeInstanceChanged', instanceId });
     }
 
     function addInstance(options) {
@@ -2229,10 +2298,29 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       vscodeApi.postMessage({ type: 'search', instanceId: activeInstanceId, includeGlob, excludeGlob });
     });
 
+    let isLocked = false;
+
+    function applyLockState(locked) {
+      isLocked = !!locked;
+      lockBtn.textContent = isLocked ? '🔒' : '🔓';
+      lockBtn.classList.toggle('active', isLocked);
+      lockBtn.title = isLocked
+        ? '已锁定：忽略鼠标点击的自动更新'
+        : '锁定：忽略鼠标点击的自动更新';
+    }
+
+    lockBtn.addEventListener('click', () => {
+      vscodeApi.postMessage({ type: 'toggleLock', locked: !isLocked });
+    });
+
     // ── Messages from extension ──────────────────────────────────────────
     function handleMessage(msg) {
       const msgInstanceId = msg && typeof msg.instanceId === 'string' ? msg.instanceId : activeInstanceId;
-
+      if (msg.type === 'lockState') {
+        applyLockState(msg.locked);
+        return;
+      }
+        
       if (msg.type === 'empty') {
         if (msgInstanceId !== activeInstanceId) { return; }
         emptyMsg.textContent   = msg.message;
