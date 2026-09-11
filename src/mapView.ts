@@ -482,10 +482,6 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     // 只有 targetSymbol 确实是查询的符号时，才把它加入 pathSymbolKeys
 	const targetMatchesWord = targetSimpleName === word;
 	const pathSymbolKeys = new Set<string>(ancestorPathSymbolKeys);
-	if (targetIsFunction && targetMatchesWord) {
-	  const targetKey = this._symbolPositionKey(uri, targetSymStart ?? pos);
-	  pathSymbolKeys.add(targetKey);
-	}
 
     const result: TreeNodeData[] = [];
     // Tracks which enclosing symbols have already received an expandable nodeId
@@ -560,13 +556,9 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
 
       // First occurrence of this enclosing symbol → expandable; subsequent → leaf
       const symKey = loc.uri.toString() + '#sym:' + symStart.line + ':' + symStart.character;
-      // 路径循环：只在 targetSymbol 匹配 word 时才启用
-      const isCurrentFunction = targetSymStart &&
-        symStart.line === targetSymStart.line &&
-        symStart.character === targetSymStart.character;
-      if (targetIsFunction && targetMatchesWord && !isCurrentFunction && pathSymbolKeys.has(symKey)) {
-        continue;
-      }
+      if (pathSymbolKeys.has(symKey)) {
+		continue;
+	  }
 	  
       const isFirst = !firstSeenKeys.has(symKey);
       if (isFirst) { firstSeenKeys.add(symKey); }
