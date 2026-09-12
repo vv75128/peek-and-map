@@ -274,14 +274,14 @@ export class PeekViewProvider implements vscode.WebviewViewProvider {
 
       let range: vscode.Range;
       if (focusMode) {
-        // Map 点击：以变量所在行为中心开一个小窗口
-        const windowPadding = Math.max(padding, 10);
-        const winStart = Math.max(best.symbol.range.start.line, pos.line - windowPadding);
-        const winEnd   = Math.min(best.symbol.range.end.line,   pos.line + windowPadding);
-        range = new vscode.Range(winStart, 0, winEnd, defDoc.lineAt(winEnd).text.length);
-      } else {
-        // 光标移动：保持原来的整个函数范围
-        range = best.symbol.range;
+        // Map 点击：以变量/函数所在行为中心开一个小窗口
+	    const windowPadding = Math.max(padding, 10);
+	    const winStart = Math.max(best.symbol.range.start.line, pos.line - windowPadding);
+	    const winEnd   = Math.min(best.symbol.range.end.line,   pos.line + windowPadding);
+	    range = new vscode.Range(winStart, 0, winEnd, defDoc.lineAt(winEnd).text.length);
+	  } else {
+	    // 光标移动：保持原来的整个函数范围
+	    range = best.symbol.range;
       }
 
       const { code, startLine } = this._expandedText(defDoc, range, focusMode ? 0 : padding);
@@ -289,7 +289,7 @@ export class PeekViewProvider implements vscode.WebviewViewProvider {
         code,
         language: LANG_MAP[defDoc.languageId] ?? 'clike',
         startLine,
-        cursorLine: pos.line,
+        cursorLine: focusMode ? pos.line : best.symbol.range.start.line,
         symbolName: this._formatSymbolWithOwner(best.symbol.name, ownerClass, best.symbol.kind),
         symbolKind: this._kindName(best.symbol.kind),
         filePath: uri.fsPath,
