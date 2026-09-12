@@ -545,6 +545,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
 
       // Declaration symbol should not be considered as "referenced by its own definition".
       if (
+		!targetIsFunction &&
         targetIsDeclaration &&
         !isDeclaration &&
         this._isFunctionLikeSymbol(enclosing.kind) &&
