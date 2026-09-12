@@ -1414,11 +1414,15 @@ export class PeekViewProvider implements vscode.WebviewViewProvider {
     }, { passive: false });
 
     function scrollCursorIntoView() {
-      const row = codeContainer.querySelector('tr.cursor-line');
-      if (row) {
-        row.scrollIntoView({ block: 'center', behavior: 'auto' });
-      }
-    }
+	  const row = codeContainer.querySelector('tr.cursor-line');
+	  if (!row) { return; }
+	  const containerRect = codeContainer.getBoundingClientRect();
+	  const rowRect = row.getBoundingClientRect();
+	  const rowHeight = rowRect.height;
+	  // 目标：让这一行位于容器上方约 1/4 处，而不是顶部
+	  const offset = (containerRect.height - rowHeight) / 4;
+	  codeContainer.scrollTop += rowRect.top - containerRect.top - offset;
+	}
   </script>
 </body>
 </html>`;
