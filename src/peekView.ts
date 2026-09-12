@@ -1416,7 +1416,7 @@ export class PeekViewProvider implements vscode.WebviewViewProvider {
     function scrollCursorIntoView() {
       const row = codeContainer.querySelector('tr.cursor-line');
       if (row) {
-        row.scrollIntoView({ block: 'start', behavior: 'auto' });
+        row.scrollIntoView({ block: 'center', behavior: 'auto' });
       }
     }
   </script>
