@@ -498,7 +498,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     // - 所有 LSP 引用都在同一文件内，但跨函数 → 静态全局变量
     let targetFunction: { uri: string; startLine: number; endLine: number } | null = null;
     let targetFileOnly: string | null = null;
-    if (targetSymbol && !this._isFunctionLikeSymbol(targetSymbol.kind)
+    if (targetSymbol
         && this._simpleSymbolName(targetSymbol.name) !== word
         && locs.length > 0) {
       const allInSameFunction = locs.every(loc =>
@@ -522,7 +522,6 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     }
 	
     for (const loc of locs) {
-	console.log('[LSP] 引用:', loc.uri.toString(), '行:', loc.range.start.line + 1);
       if (!this._passesFileFilter(loc.uri, session.includeGlob, session.excludeGlob)) {
         continue;
       }
@@ -643,7 +642,6 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     targetFunction: { uri: string; startLine: number; endLine: number } | null,
     targetFileOnly: string | null
   ): Promise<TreeNodeData[]> {
-    console.log('[TEXT] _resolveByTextSearch called, word:', word);
     if (!word || word.length < 2) { return []; }
 
     const result: TreeNodeData[] = [];
