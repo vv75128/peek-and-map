@@ -459,7 +459,6 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       );
     } catch { /* no reference provider */ }
     if (!locs) { locs = []; }
-    console.log('[TEXT] LSP locs 数量:', locs.length, 'word:', word);
 
     const targetSymbols = await this._getDocumentSymbols(uri);
     const targetSymbol = this._deepestContaining(targetSymbols, pos);
@@ -494,28 +493,36 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     // Tracks which enclosing symbols have already received an expandable nodeId
     const firstSeenKeys = new Set<string>();
 
-    // 用 LSP 结果判断 word 是不是局部变量：
-    // 如果所有 LSP 引用都在同一函数内，说明是局部变量
+    // 用 LSP 结果判断 word 是局部变量还是静态全局变量：
+    // - 所有 LSP 引用都在同一函数内 → 局部变量
+    // - 所有 LSP 引用都在同一文件内，但跨函数 → 静态全局变量
     let targetFunction: { uri: string; startLine: number; endLine: number } | null = null;
-    if (targetSymbol && this._isFunctionLikeSymbol(targetSymbol.kind)
+    let targetFileOnly: string | null = null;
+    if (targetSymbol && !this._isFunctionLikeSymbol(targetSymbol.kind)
         && this._simpleSymbolName(targetSymbol.name) !== word
         && locs.length > 0) {
-      // 检查 locs 里所有引用是否都在当前函数内
       const allInSameFunction = locs.every(loc =>
         loc.uri.toString() === uri.toString() &&
         loc.range.start.line >= targetSymbol!.range.start.line &&
         loc.range.start.line <= targetSymbol!.range.end.line
       );
+      const allInSameFile = locs.every(loc =>
+        loc.uri.toString() === uri.toString()
+      );
+
       if (allInSameFunction) {
         targetFunction = {
           uri: uri.toString(),
           startLine: targetSymbol.range.start.line,
           endLine: targetSymbol.range.end.line,
         };
+      } else if (allInSameFile) {
+        targetFileOnly = uri.toString();
       }
     }
 	
     for (const loc of locs) {
+	console.log('[LSP] 引用:', loc.uri.toString(), '行:', loc.range.start.line + 1);
       if (!this._passesFileFilter(loc.uri, session.includeGlob, session.excludeGlob)) {
         continue;
       }
@@ -595,6 +602,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       const nodeId = isFirst
         ? this._allocRefNodeId(session, loc.uri, symStart, new Set<string>([...pathSymbolKeys, symKey]))
         : `leaf_${++session.nodeCounter}`;
+		
 
       result.push({
         nodeId,
@@ -611,13 +619,12 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       });
     }
 
-	// ── 补充文本搜索结果 ──
-    console.log('[TEXT] 准备调用 _resolveByTextSearch, word:', word, 'locs 数量:', locs.length);
+    // ── 始终补充文本搜索，用过滤条件控制误报 ──
     const existingUris = new Set<string>();
     for (const loc of locs) {
       existingUris.add(`${loc.uri.toString()}#${loc.range.start.line}:${loc.range.start.character}`);
     }
-    const textResults = await this._resolveByTextSearch(session, word, wsRoot, existingUris, targetFunction);
+    const textResults = await this._resolveByTextSearch(session, word, wsRoot, existingUris, targetFunction, targetFileOnly);
     result.push(...textResults);
 
     return result;
@@ -633,14 +640,15 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     word: string,
     wsRoot: string,
     existingUris: Set<string>,
-    targetFunction: { uri: string; startLine: number; endLine: number } | null
+    targetFunction: { uri: string; startLine: number; endLine: number } | null,
+    targetFileOnly: string | null
   ): Promise<TreeNodeData[]> {
-	console.log('[TEXT] _resolveByTextSearch called, word:', word, 'length:', word?.length);
+    console.log('[TEXT] _resolveByTextSearch called, word:', word);
     if (!word || word.length < 2) { return []; }
 
     const result: TreeNodeData[] = [];
     const seen = new Set<string>(existingUris);
-	const commentCache = new Map<string, boolean[]>();
+	const commentStartCache = new Map<string, number[]>();
 
     try {
       const rgPath = await this._findRipgrep();
@@ -654,16 +662,12 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
         word,
         wsRoot,
       ];
-      console.log('[TEXT] rg args:', JSON.stringify(args));
-      console.log('[TEXT] wsRoot:', wsRoot);
 
       let stdout = '';
       try {
         const result = await execFileAsync(rgPath, args, { maxBuffer: 10 * 1024 * 1024 });
         stdout = result.stdout;
-        console.log('[TEXT] rg 执行成功，输出长度:', stdout.length);
       } catch (e: any) {
-        console.log('[TEXT] rg 执行失败:', e?.message, 'stderr:', e?.stderr);
         return result;   // ← result 是外层已声明的数组，直接返回空
       }
 
@@ -673,10 +677,14 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       for (const line of lines) {
         let match: any;
         try { match = JSON.parse(line); } catch { continue; }
-        if (match.type !== 'match') { continue; }
+        if (match.type !== 'match') {
+          continue;
+        }
 
         const data = match.data;
-        if (!data || !data.path || !data.line_number) { continue; }
+        if (!data || !data.path || !data.line_number) {
+          continue;
+        }
 
         const filePath = data.path.text;
         const lineNum = data.line_number - 1;
@@ -690,10 +698,10 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
         } catch { continue; }
 
         // 整文件注释扫描，缓存结果
-        let commentLines = commentCache.get(filePath);
-        if (!commentLines) {
-          commentLines = this._computeCommentLines(doc);
-          commentCache.set(filePath, commentLines);
+        let commentStartCols = commentStartCache.get(filePath);
+        if (!commentStartCols) {
+          commentStartCols = this._computeCommentLines(doc);
+          commentStartCache.set(filePath, commentStartCols);
         }
 
         for (const submatch of submatches) {
@@ -703,7 +711,13 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
           seen.add(key);
 
           // 排除注释里的匹配
-          if (commentLines[lineNum]) { continue; }
+          if (commentStartCols[lineNum] >= 0 && startCol >= commentStartCols[lineNum]) { continue; }
+		  
+		  // 排除字符串字面量里的匹配
+          const lineText = doc.lineAt(lineNum).text;
+          const beforeMatch = lineText.slice(0, startCol);
+          const quoteCount = (beforeMatch.match(/"/g) || []).length;
+          if (quoteCount % 2 === 1) { continue; }
 
           const enclosing = db.findEnclosingSymbol(filePath, lineNum);
 		  
@@ -715,6 +729,9 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
               && enclosing.range_end_line === targetFunction.endLine;
             if (!sameFile || !inSameFunction) { continue; }
           }
+
+          // 如果是静态全局变量，只保留当前文件的匹配
+          if (targetFileOnly && uriStr !== targetFileOnly) { continue; }
 		  
           const enclosingName = enclosing ? enclosing.name : '';
           const enclosingStart = enclosing
@@ -772,18 +789,17 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
   }
   
   /**
-  * 扫描整个文件，返回每一行是否在注释中。
-  * 处理行注释和块注释，包括跨行块注释。
-  */
-  private _computeCommentLines(doc: vscode.TextDocument): boolean[] {
+   * 扫描整个文件，返回每一行的注释起始列。
+   * -1 表示该行没有注释；>= 0 表示从该列开始是注释。
+   */
+  private _computeCommentLines(doc: vscode.TextDocument): number[] {
     const lines = doc.lineCount;
-    const inComment: boolean[] = new Array(lines).fill(false);
+    const commentStartCols: number[] = new Array(lines).fill(-1);
     let inBlockComment = false;
 
     for (let i = 0; i < lines; i++) {
       const text = doc.lineAt(i).text;
       let j = 0;
-      let lineHasComment = false;
 
       while (j < text.length) {
         if (inBlockComment) {
@@ -792,7 +808,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
             inBlockComment = false;
             j = end + 2;
           } else {
-            lineHasComment = true;
+            if (commentStartCols[i] === -1) { commentStartCols[i] = 0; }
             break;
           }
         } else {
@@ -800,21 +816,20 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
           const blockStart = text.indexOf('/*', j);
 
           if (lineComment >= 0 && (blockStart < 0 || lineComment < blockStart)) {
-            lineHasComment = true;
+            if (commentStartCols[i] === -1) { commentStartCols[i] = lineComment; }
             break;
           } else if (blockStart >= 0) {
             inBlockComment = true;
+            if (commentStartCols[i] === -1) { commentStartCols[i] = blockStart; }
             j = blockStart + 2;
           } else {
             break;
           }
         }
       }
-
-      inComment[i] = lineHasComment;
     }
 
-    return inComment;
+    return commentStartCols;
   }
   // ── Expand: Reference hierarchy ────────────────────────────────────────────
 
