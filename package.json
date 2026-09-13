@@ -58,7 +58,7 @@
           "type": "webview",
           "id": "peekView.view",
           "name": "Peek View",
-          "icon": "media/icon.png"
+          "icon": "$(eye)"
         }
       ],
       "mapPanel": [
@@ -66,7 +66,7 @@
           "type": "webview",
           "id": "mapView.view",
           "name": "Map View",
-          "icon": "media/icon.png"
+          "icon": "$(map)"
         }
       ],
       "symbolPanel": [
@@ -74,7 +74,7 @@
           "type": "webview",
           "id": "symbolSearch.view",
           "name": "Symbol Search",
-          "icon": "media/icon.png"
+          "icon": "$(search-sparkle)"
         }
       ]
     },
