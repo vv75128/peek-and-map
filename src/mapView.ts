@@ -494,6 +494,27 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     // Tracks which enclosing symbols have already received an expandable nodeId
     const firstSeenKeys = new Set<string>();
 
+    // 用 LSP 结果判断 word 是不是局部变量：
+    // 如果所有 LSP 引用都在同一函数内，说明是局部变量
+    let targetFunction: { uri: string; startLine: number; endLine: number } | null = null;
+    if (targetSymbol && this._isFunctionLikeSymbol(targetSymbol.kind)
+        && this._simpleSymbolName(targetSymbol.name) !== word
+        && locs.length > 0) {
+      // 检查 locs 里所有引用是否都在当前函数内
+      const allInSameFunction = locs.every(loc =>
+        loc.uri.toString() === uri.toString() &&
+        loc.range.start.line >= targetSymbol!.range.start.line &&
+        loc.range.start.line <= targetSymbol!.range.end.line
+      );
+      if (allInSameFunction) {
+        targetFunction = {
+          uri: uri.toString(),
+          startLine: targetSymbol.range.start.line,
+          endLine: targetSymbol.range.end.line,
+        };
+      }
+    }
+	
     for (const loc of locs) {
       if (!this._passesFileFilter(loc.uri, session.includeGlob, session.excludeGlob)) {
         continue;
@@ -596,7 +617,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     for (const loc of locs) {
       existingUris.add(`${loc.uri.toString()}#${loc.range.start.line}:${loc.range.start.character}`);
     }
-    const textResults = await this._resolveByTextSearch(session, word, wsRoot, existingUris);
+    const textResults = await this._resolveByTextSearch(session, word, wsRoot, existingUris, targetFunction);
     result.push(...textResults);
 
     return result;
@@ -611,7 +632,8 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     },
     word: string,
     wsRoot: string,
-    existingUris: Set<string>
+    existingUris: Set<string>,
+    targetFunction: { uri: string; startLine: number; endLine: number } | null
   ): Promise<TreeNodeData[]> {
 	console.log('[TEXT] _resolveByTextSearch called, word:', word, 'length:', word?.length);
     if (!word || word.length < 2) { return []; }
@@ -677,6 +699,16 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
           if (this._isInComment(lineText, startCol)) { continue; }
 
           const enclosing = db.findEnclosingSymbol(filePath, lineNum);
+		  
+		  // 如果目标符号是局部变量，只保留同一函数内的匹配
+          if (targetFunction) {
+            const sameFile = uriStr === targetFunction.uri;
+            const inSameFunction = enclosing
+              && enclosing.range_start_line === targetFunction.startLine
+              && enclosing.range_end_line === targetFunction.endLine;
+            if (!sameFile || !inSameFunction) { continue; }
+          }
+		  
           const enclosingName = enclosing ? enclosing.name : '';
           const enclosingStart = enclosing
             ? { line: enclosing.selection_start_line, char: enclosing.selection_start_char }
