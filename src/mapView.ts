@@ -499,25 +499,37 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     let targetFunction: { uri: string; startLine: number; endLine: number } | null = null;
     let targetFileOnly: string | null = null;
     if (targetSymbol
-        && this._simpleSymbolName(targetSymbol.name) !== word
-        && locs.length > 0) {
-      const allInSameFunction = locs.every(loc =>
-        loc.uri.toString() === uri.toString() &&
-        loc.range.start.line >= targetSymbol!.range.start.line &&
-        loc.range.start.line <= targetSymbol!.range.end.line
-      );
-      const allInSameFile = locs.every(loc =>
-        loc.uri.toString() === uri.toString()
-      );
+        && this._simpleSymbolName(targetSymbol.name) !== word) {
+      if (locs.length > 0) {
+        // 用 LSP 结果判断是局部变量还是静态全局变量
+        const allInSameFunction = locs.every(loc =>
+          loc.uri.toString() === uri.toString() &&
+          loc.range.start.line >= targetSymbol!.range.start.line &&
+          loc.range.start.line <= targetSymbol!.range.end.line
+        );
+        const allInSameFile = locs.every(loc =>
+          loc.uri.toString() === uri.toString()
+        );
 
-      if (allInSameFunction) {
-        targetFunction = {
-          uri: uri.toString(),
-          startLine: targetSymbol.range.start.line,
-          endLine: targetSymbol.range.end.line,
-        };
-      } else if (allInSameFile) {
-        targetFileOnly = uri.toString();
+        if (allInSameFunction) {
+          targetFunction = {
+            uri: uri.toString(),
+            startLine: targetSymbol.range.start.line,
+            endLine: targetSymbol.range.end.line,
+          };
+        } else if (allInSameFile) {
+          targetFileOnly = uri.toString();
+        }
+      } else {
+        // LSP 返回空，无法判断作用域，保守起见按局部变量处理
+        // （只保留当前函数内的匹配，避免其他函数的同名参数误报）
+        if (this._isFunctionLikeSymbol(targetSymbol.kind)) {
+          targetFunction = {
+            uri: uri.toString(),
+            startLine: targetSymbol.range.start.line,
+            endLine: targetSymbol.range.end.line,
+          };
+        }
       }
     }
 	
@@ -655,7 +667,6 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       const args = [
         '--json',
         '-w',
-        '-m', '20',
         '-g', '*.{c,h,cpp,hpp,cc,cxx,hxx}',
         word,
         wsRoot,
@@ -730,7 +741,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
 
           // 如果是静态全局变量，只保留当前文件的匹配
           if (targetFileOnly && uriStr !== targetFileOnly) { continue; }
-		  
+
           const enclosingName = enclosing ? enclosing.name : '';
           const enclosingStart = enclosing
             ? { line: enclosing.selection_start_line, char: enclosing.selection_start_char }
