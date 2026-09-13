@@ -2,10 +2,16 @@ import * as vscode from 'vscode';
 import { PeekViewProvider } from './peekView';
 import { MapViewProvider } from './mapView';
 import { SymbolSearchViewProvider } from './symbolSearchView';
+import { DatabaseManager } from './db/manager';
 
-export function activate(context: vscode.ExtensionContext): void {
+export async function activate(context: vscode.ExtensionContext): Promise<void> {
+  const dbManager = new DatabaseManager(context);
+  dbManager.init().catch((e) => {
+    console.warn('[DB] init failed', e);
+  });
+
   const peekprovider = new PeekViewProvider(context.extensionUri);
-  const mapProvider = new MapViewProvider(context.extensionUri, context);
+  const mapProvider = new MapViewProvider(context.extensionUri, context, dbManager);
   const symbolSearchProvider = new SymbolSearchViewProvider(context.extensionUri, context);
 
   // Allow MapViewProvider to update the peek view directly on single-click

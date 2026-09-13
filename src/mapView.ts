@@ -1,9 +1,14 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 import { TreeNodeData } from './types';
 import { getNonce } from './utils';
 import { PeekViewProvider } from './peekView';
 import { buildKindIconFunction, getThemeColorsCss, symbolKindToName } from './viewCommon';
+import { DatabaseManager } from './db/manager';
+
+const execFileAsync = promisify(execFile);
 
 export class MapViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'mapView.view';
@@ -30,7 +35,8 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
 
   constructor(
     private readonly _extensionUri: vscode.Uri,
-    private readonly _context: vscode.ExtensionContext
+    private readonly _context: vscode.ExtensionContext,
+    private readonly _dbManager: DatabaseManager
   ) {
     const rawMode = this._context.workspaceState.get<string>(MapViewProvider.VIEW_MODE_STATE_KEY);
     this._viewMode = this._normalizeViewMode(
@@ -452,7 +458,8 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
         'vscode.executeReferenceProvider', uri, pos
       );
     } catch { /* no reference provider */ }
-    if (!locs || locs.length === 0) { return []; }
+    if (!locs) { locs = []; }
+    console.log('[TEXT] LSP locs 数量:', locs.length, 'word:', word);
 
     const targetSymbols = await this._getDocumentSymbols(uri);
     const targetSymbol = this._deepestContaining(targetSymbols, pos);
@@ -583,9 +590,172 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       });
     }
 
+	// ── 补充文本搜索结果 ──
+    console.log('[TEXT] 准备调用 _resolveByTextSearch, word:', word, 'locs 数量:', locs.length);
+    const existingUris = new Set<string>();
+    for (const loc of locs) {
+      existingUris.add(`${loc.uri.toString()}#${loc.range.start.line}:${loc.range.start.character}`);
+    }
+    const textResults = await this._resolveByTextSearch(session, word, wsRoot, existingUris);
+    result.push(...textResults);
+
     return result;
   }
 
+  private async _resolveByTextSearch(
+    session: {
+      refNodeMap: Map<string, { uri: vscode.Uri; position: vscode.Position; pathSymbolKeys: string[] }>;
+      nodeCounter: number;
+      includeGlob: string;
+      excludeGlob: string;
+    },
+    word: string,
+    wsRoot: string,
+    existingUris: Set<string>
+  ): Promise<TreeNodeData[]> {
+	console.log('[TEXT] _resolveByTextSearch called, word:', word, 'length:', word?.length);
+    if (!word || word.length < 2) { return []; }
+
+    const result: TreeNodeData[] = [];
+    const seen = new Set<string>(existingUris);
+
+    try {
+      const rgPath = await this._findRipgrep();
+      if (!rgPath) { return []; }
+
+      const args = [
+        '--json',
+        '-w',
+        '-m', '20',
+        '-g', '*.{c,h,cpp,hpp,cc,cxx,hxx}',
+        word,
+        wsRoot,
+      ];
+      console.log('[TEXT] rg args:', JSON.stringify(args));
+      console.log('[TEXT] wsRoot:', wsRoot);
+
+      let stdout = '';
+      try {
+        const result = await execFileAsync(rgPath, args, { maxBuffer: 10 * 1024 * 1024 });
+        stdout = result.stdout;
+        console.log('[TEXT] rg 执行成功，输出长度:', stdout.length);
+      } catch (e: any) {
+        console.log('[TEXT] rg 执行失败:', e?.message, 'stderr:', e?.stderr);
+        return result;   // ← result 是外层已声明的数组，直接返回空
+      }
+
+      const lines = stdout.split('\n').filter(Boolean);
+      const db = this._dbManager.getDb();
+
+      for (const line of lines) {
+        let match: any;
+        try { match = JSON.parse(line); } catch { continue; }
+        if (match.type !== 'match') { continue; }
+
+        const data = match.data;
+        if (!data || !data.path || !data.line_number) { continue; }
+
+        const filePath = data.path.text;
+        const lineNum = data.line_number - 1;
+        const uriStr = vscode.Uri.file(filePath).toString();
+        const submatches = data.submatches || [];
+
+		// 读文件内容，用于注释判断（同一个文件只读一次）
+        let doc: vscode.TextDocument | undefined;
+        try {
+          doc = await vscode.workspace.openTextDocument(vscode.Uri.file(filePath));
+        } catch { continue; }
+		
+        for (const submatch of submatches) {
+          const startCol = submatch.start;
+          const key = `${uriStr}#${lineNum}:${startCol}`;
+          if (seen.has(key)) { continue; }
+          seen.add(key);
+
+          // 排除注释里的匹配
+          const lineText = doc.lineAt(lineNum).text;
+          if (this._isInComment(lineText, startCol)) { continue; }
+
+          const enclosing = db.findEnclosingSymbol(filePath, lineNum);
+          const enclosingName = enclosing ? enclosing.name : '';
+          const enclosingStart = enclosing
+            ? { line: enclosing.selection_start_line, char: enclosing.selection_start_char }
+            : { line: lineNum, char: startCol };
+
+          result.push({
+            nodeId: enclosing ? `ref_${++session.nodeCounter}` : `leaf_${++session.nodeCounter}`,
+            label: enclosingName || word,
+            detail: this._relativePath(filePath, wsRoot),
+            line: enclosingStart.line,
+            character: enclosingStart.char,
+            callLine: lineNum,
+            callCharacter: startCol,
+            uri: uriStr,
+            kind: enclosing ? 'Function' : 'TextMatch',
+            isDeclaration: false,
+            isTextSearch: true,
+            preview: '',
+          });
+        }
+      }
+    } catch {
+      // rg 不可用，静默返回
+    }
+
+    return result;
+  }
+
+  private async _findRipgrep(): Promise<string | null> {
+    const appRoot = vscode.env.appRoot;
+    const rgName = process.platform === 'win32' ? 'rg.exe' : 'rg';
+    const platformDir = `${process.platform}-${process.arch}`;
+
+    const candidates: string[] = [
+      path.join(appRoot, 'node_modules.asar.unpacked', '@vscode', 'ripgrep-universal', 'bin', platformDir, rgName),
+      path.join(appRoot, 'node_modules', '@vscode', 'ripgrep-universal', 'bin', platformDir, rgName),
+      path.join(appRoot, 'node_modules.asar.unpacked', '@vscode', 'ripgrep', 'bin', rgName),
+      path.join(appRoot, 'node_modules', '@vscode', 'ripgrep', 'bin', rgName),
+    ];
+
+    for (const c of candidates) {
+      try {
+        await execFileAsync(c, ['--version']);
+        return c;
+      } catch { /* 试下一个 */ }
+    }
+
+    try {
+      await execFileAsync(rgName, ['--version']);
+      return rgName;
+    } catch { /* 没有 */ }
+
+    return null;
+  }
+  
+  /**
+  * 判断某一行的某个列位置是否在注释里。
+  */
+  private _isInComment(lineText: string, col: number): boolean {
+    const before = lineText.slice(0, col);
+
+    // 行首（去空白后）是 // 或 * 或 /*
+    const trimmed = before.trimStart();
+    if (trimmed.startsWith('//') || trimmed.startsWith('*') || trimmed.startsWith('/*')) {
+      return true;
+    }
+
+    // 匹配位置在行内 // 之后
+    if (before.indexOf('//') >= 0) { return true; }
+
+    // 匹配位置在未闭合的 /* 之后
+    const blockStart = before.lastIndexOf('/*');
+    if (blockStart >= 0) {
+      const blockEnd = before.indexOf('*/', blockStart + 2);
+      if (blockEnd < 0) { return true; }
+    }
+
+    return false;
+  }
   // ── Expand: Reference hierarchy ────────────────────────────────────────────
 
   private async _expandRef(instanceId: string, nodeId: string): Promise<void> {
@@ -2549,7 +2719,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       const isLeaf = item.nodeId.startsWith('leaf_');
       const nameHtml = renderOutlineNameHtml(item.label, item.kind || 'Function', outlineQualifiedNameDisplay);
       const kindHtml = item.kind
-        ? '<span class="item-icon" style="color:var(--peek-kind-' + item.kind + ',var(--vscode-foreground,#ccc))">' + kindSymbol(item.kind) + '</span>'
+        ? '<span class="item-icon" style="color:var(--peek-kind-' + item.kind + ',var(--vscode-foreground,#ccc))">' + (item.isTextSearch ? '⚡' : kindSymbol(item.kind)) + '</span>'
         : '';
       const toggleChar = isLeaf ? '' : '<svg viewBox="0 0 16 16"><polyline points="6,2 12,8 6,14"/></svg>';
       const callLine = item.callLine != null ? item.callLine : item.line;

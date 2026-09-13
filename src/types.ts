@@ -29,6 +29,7 @@ export interface TreeNodeData {
   kind?: string;
   isDeclaration?: boolean;
   preview: string;
+  isTextSearch?: boolean;
 }
 
 export interface TokenColorRule {
