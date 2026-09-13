@@ -722,11 +722,14 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
           // 排除注释里的匹配
           if (commentStartCols[lineNum] >= 0 && startCol >= commentStartCols[lineNum]) { continue; }
 		  
-		  // 排除字符串字面量里的匹配
+		  // 排除字符串字面量里的匹配（#include 行除外）
           const lineText = doc.lineAt(lineNum).text;
-          const beforeMatch = lineText.slice(0, startCol);
-          const quoteCount = (beforeMatch.match(/"/g) || []).length;
-          if (quoteCount % 2 === 1) { continue; }
+          const isIncludeLine = /^\s*#\s*include\b/.test(lineText);
+          if (!isIncludeLine) {
+            const beforeMatch = lineText.slice(0, startCol);
+            const quoteCount = (beforeMatch.match(/"/g) || []).length;
+            if (quoteCount % 2 === 1) { continue; }
+          }
 
           const enclosing = db.findEnclosingSymbol(filePath, lineNum);
 		  
