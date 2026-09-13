@@ -654,7 +654,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     targetFunction: { uri: string; startLine: number; endLine: number } | null,
     targetFileOnly: string | null
   ): Promise<TreeNodeData[]> {
-    if (!word || word.length < 2) { return []; }
+    if (!word) { return []; }
 
     const result: TreeNodeData[] = [];
     const seen = new Set<string>(existingUris);
