@@ -22,7 +22,10 @@
     "theme": "dark"
   },
   "activationEvents": [
-    "onStartupFinished"
+    "onStartupFinished",
+	"onView:peekView.view",
+    "onView:mapView.view",
+	"onView:symbolSearch.view"
   ],
   "extensionKind": [
     "ui",
