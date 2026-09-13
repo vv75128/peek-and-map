@@ -2714,12 +2714,35 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       }).join('');
     }
 
-    function renderTreeNodeHtml(item, depth) {
+        function renderTreeNodeHtml(item, depth) {
       const pad = depth * 16;
       const isLeaf = item.nodeId.startsWith('leaf_');
       const nameHtml = renderOutlineNameHtml(item.label, item.kind || 'Function', outlineQualifiedNameDisplay);
+
+      const kindTitleMap = {
+        'Function': '函数',
+        'Method': '方法',
+        'Constructor': '构造函数',
+        'Variable': '变量',
+        'Constant': '常量',
+        'Field': '字段',
+        'Property': '属性',
+        'Class': '类',
+        'Struct': '结构体',
+        'Interface': '接口',
+        'Enum': '枚举',
+        'EnumMember': '枚举成员',
+        'Namespace': '命名空间',
+        'Module': '模块',
+        'File': '文件',
+        'Global': '全局作用域',
+        'TextMatch': '文本匹配',
+      };
+      const iconTitle = item.isTextSearch
+        ? '文本匹配：由 ripgrep 搜索找到，未经 LSP 语义确认，可能是注释或字符串里的误报'
+        : (kindTitleMap[item.kind] || item.kind || '');
       const kindHtml = item.kind
-        ? '<span class="item-icon" style="color:var(--peek-kind-' + item.kind + ',var(--vscode-foreground,#ccc))">' + (item.isTextSearch ? '⚡' : kindSymbol(item.kind)) + '</span>'
+        ? '<span class="item-icon" title="' + escapeAttr(iconTitle) + '" style="color:var(--peek-kind-' + item.kind + ',var(--vscode-foreground,#ccc))">' + (item.isTextSearch ? '⚡' : kindSymbol(item.kind)) + '</span>'
         : '';
       const toggleChar = isLeaf ? '' : '<svg viewBox="0 0 16 16"><polyline points="6,2 12,8 6,14"/></svg>';
       const callLine = item.callLine != null ? item.callLine : item.line;
