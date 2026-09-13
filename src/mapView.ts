@@ -640,6 +640,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
 
     const result: TreeNodeData[] = [];
     const seen = new Set<string>(existingUris);
+	const commentCache = new Map<string, boolean[]>();
 
     try {
       const rgPath = await this._findRipgrep();
@@ -687,7 +688,14 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
         try {
           doc = await vscode.workspace.openTextDocument(vscode.Uri.file(filePath));
         } catch { continue; }
-		
+
+        // 整文件注释扫描，缓存结果
+        let commentLines = commentCache.get(filePath);
+        if (!commentLines) {
+          commentLines = this._computeCommentLines(doc);
+          commentCache.set(filePath, commentLines);
+        }
+
         for (const submatch of submatches) {
           const startCol = submatch.start;
           const key = `${uriStr}#${lineNum}:${startCol}`;
@@ -695,8 +703,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
           seen.add(key);
 
           // 排除注释里的匹配
-          const lineText = doc.lineAt(lineNum).text;
-          if (this._isInComment(lineText, startCol)) { continue; }
+          if (commentLines[lineNum]) { continue; }
 
           const enclosing = db.findEnclosingSymbol(filePath, lineNum);
 		  
@@ -765,28 +772,49 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
   }
   
   /**
-  * 判断某一行的某个列位置是否在注释里。
+  * 扫描整个文件，返回每一行是否在注释中。
+  * 处理行注释和块注释，包括跨行块注释。
   */
-  private _isInComment(lineText: string, col: number): boolean {
-    const before = lineText.slice(0, col);
+  private _computeCommentLines(doc: vscode.TextDocument): boolean[] {
+    const lines = doc.lineCount;
+    const inComment: boolean[] = new Array(lines).fill(false);
+    let inBlockComment = false;
 
-    // 行首（去空白后）是 // 或 * 或 /*
-    const trimmed = before.trimStart();
-    if (trimmed.startsWith('//') || trimmed.startsWith('*') || trimmed.startsWith('/*')) {
-      return true;
+    for (let i = 0; i < lines; i++) {
+      const text = doc.lineAt(i).text;
+      let j = 0;
+      let lineHasComment = false;
+
+      while (j < text.length) {
+        if (inBlockComment) {
+          const end = text.indexOf('*/', j);
+          if (end >= 0) {
+            inBlockComment = false;
+            j = end + 2;
+          } else {
+            lineHasComment = true;
+            break;
+          }
+        } else {
+          const lineComment = text.indexOf('//', j);
+          const blockStart = text.indexOf('/*', j);
+
+          if (lineComment >= 0 && (blockStart < 0 || lineComment < blockStart)) {
+            lineHasComment = true;
+            break;
+          } else if (blockStart >= 0) {
+            inBlockComment = true;
+            j = blockStart + 2;
+          } else {
+            break;
+          }
+        }
+      }
+
+      inComment[i] = lineHasComment;
     }
 
-    // 匹配位置在行内 // 之后
-    if (before.indexOf('//') >= 0) { return true; }
-
-    // 匹配位置在未闭合的 /* 之后
-    const blockStart = before.lastIndexOf('/*');
-    if (blockStart >= 0) {
-      const blockEnd = before.indexOf('*/', blockStart + 2);
-      if (blockEnd < 0) { return true; }
-    }
-
-    return false;
+    return inComment;
   }
   // ── Expand: Reference hierarchy ────────────────────────────────────────────
 
