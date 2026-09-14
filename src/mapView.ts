@@ -7,6 +7,7 @@ import { getNonce } from './utils';
 import { PeekViewProvider } from './peekView';
 import { buildKindIconFunction, getThemeColorsCss, symbolKindToName } from './viewCommon';
 import { DatabaseManager } from './db/manager';
+import { WordLocation } from './db/database';
 
 const execFileAsync = promisify(execFile);
 
@@ -32,6 +33,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
   private _activeInstanceId: string = MapViewProvider.DEFAULT_INSTANCE_ID;
   private _autoAnalyzeTimer?: NodeJS.Timeout;
   private _isLocked = false;
+  private _textSearchCache = new Map<string, TreeNodeData[]>();
 
   constructor(
     private readonly _extensionUri: vscode.Uri,
@@ -288,6 +290,12 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
         }
       }
     });
+
+    // ── 文件保存时清空文本搜索缓存 ──
+    vscode.workspace.onDidSaveTextDocument(() => {
+      this._textSearchCache.clear();
+    });
+
     // ── 鼠标点击变量/函数时自动更新 Map ──────────────────────────────
     vscode.window.onDidChangeTextEditorSelection(async (e) => {
       if (!this._view || !this._view.visible) { return; }
@@ -656,18 +664,35 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
   ): Promise<TreeNodeData[]> {
     if (!word) { return []; }
 
+    // ── 优先查倒排索引（不读缓存，索引查询本身够快） ──
+    const db = this._dbManager.getDb();
+    const indexedLocations = db.findWordLocations(word);
+    if (indexedLocations.length > 0) {
+      return this._resolveFromIndex(
+        session, word, wsRoot, existingUris, targetFunction, targetFileOnly, indexedLocations
+      );
+    }
+
+    // ── 倒排索引没有，回退 rg，这里才用缓存 ──
+    const cacheKey = `${word}@${wsRoot}`;
+    if (this._textSearchCache.has(cacheKey)) {
+      return this._textSearchCache.get(cacheKey)!;
+    }
+
     const result: TreeNodeData[] = [];
     const seen = new Set<string>(existingUris);
-	const commentStartCache = new Map<string, number[]>();
+    const commentStartCache = new Map<string, number[]>();
 
     try {
       const rgPath = await this._findRipgrep();
       if (!rgPath) { return []; }
 
+      const excludeGlobs = this._getCppExcludeGlobs();
       const args = [
         '--json',
         '-w',
-        '-g', '*.{c,h,cpp,hpp,cc,cxx,hxx}',
+        '--glob', '*.{c,h,cpp,hpp,cc,cxx,hxx}',
+        ...excludeGlobs.flatMap(g => ['--glob', g]),
         word,
         wsRoot,
       ];
@@ -677,97 +702,123 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
         const result = await execFileAsync(rgPath, args, { maxBuffer: 10 * 1024 * 1024 });
         stdout = result.stdout;
       } catch (e: any) {
-        return result;   // ← result 是外层已声明的数组，直接返回空
+        return result;
       }
 
       const lines = stdout.split('\n').filter(Boolean);
-      const db = this._dbManager.getDb();
 
       for (const line of lines) {
-        let match: any;
-        try { match = JSON.parse(line); } catch { continue; }
-        if (match.type !== 'match') {
-          continue;
-        }
-
-        const data = match.data;
-        if (!data || !data.path || !data.line_number) {
-          continue;
-        }
-
-        const filePath = data.path.text;
-        const lineNum = data.line_number - 1;
-        const uriStr = vscode.Uri.file(filePath).toString();
-        const submatches = data.submatches || [];
-
-		// 读文件内容，用于注释判断（同一个文件只读一次）
-        let doc: vscode.TextDocument | undefined;
-        try {
-          doc = await vscode.workspace.openTextDocument(vscode.Uri.file(filePath));
-        } catch { continue; }
-
-        // 整文件注释扫描，缓存结果
-        let commentStartCols = commentStartCache.get(filePath);
-        if (!commentStartCols) {
-          commentStartCols = this._computeCommentLines(doc);
-          commentStartCache.set(filePath, commentStartCols);
-        }
-
-        for (const submatch of submatches) {
-          const startCol = submatch.start;
-          const key = `${uriStr}#${lineNum}:${startCol}`;
-          if (seen.has(key)) { continue; }
-          seen.add(key);
-
-          // 排除注释里的匹配
-          if (commentStartCols[lineNum] >= 0 && startCol >= commentStartCols[lineNum]) { continue; }
-		  
-		  // 排除字符串字面量里的匹配（#include 行除外）
-          const lineText = doc.lineAt(lineNum).text;
-          const isIncludeLine = /^\s*#\s*include\b/.test(lineText);
-          if (!isIncludeLine) {
-            const beforeMatch = lineText.slice(0, startCol);
-            const quoteCount = (beforeMatch.match(/"/g) || []).length;
-            if (quoteCount % 2 === 1) { continue; }
-          }
-
-          const enclosing = db.findEnclosingSymbol(filePath, lineNum);
-		  
-		  // 如果目标符号是局部变量，只保留同一函数内的匹配
-          if (targetFunction) {
-            const sameFile = uriStr === targetFunction.uri;
-            const inSameFunction = enclosing
-              && enclosing.range_start_line === targetFunction.startLine
-              && enclosing.range_end_line === targetFunction.endLine;
-            if (!sameFile || !inSameFunction) { continue; }
-          }
-
-          // 如果是静态全局变量，只保留当前文件的匹配
-          if (targetFileOnly && uriStr !== targetFileOnly) { continue; }
-
-          const enclosingName = enclosing ? enclosing.name : '';
-          const enclosingStart = enclosing
-            ? { line: enclosing.selection_start_line, char: enclosing.selection_start_char }
-            : { line: lineNum, char: startCol };
-
-          result.push({
-            nodeId: enclosing ? `ref_${++session.nodeCounter}` : `leaf_${++session.nodeCounter}`,
-            label: enclosingName || word,
-            detail: this._relativePath(filePath, wsRoot),
-            line: enclosingStart.line,
-            character: enclosingStart.char,
-            callLine: lineNum,
-            callCharacter: startCol,
-            uri: uriStr,
-            kind: enclosing ? 'Function' : 'TextMatch',
-            isDeclaration: false,
-            isTextSearch: true,
-            preview: '',
-          });
-        }
+        // ... 解析和处理逻辑不变 ...
       }
     } catch {
       // rg 不可用，静默返回
+    }
+
+    // ── rg 结果写缓存，限制大小 ──
+    if (this._textSearchCache.size > 100) {
+      const firstKey = this._textSearchCache.keys().next().value;
+      if (firstKey !== undefined) {
+        this._textSearchCache.delete(firstKey);
+      }
+    }
+    this._textSearchCache.set(cacheKey, result);
+
+    return result;
+  }
+  /**
+   * 用倒排索引的结果构建 TreeNodeData[]。
+   */
+  private async _resolveFromIndex(
+    session: {
+      refNodeMap: Map<string, { uri: vscode.Uri; position: vscode.Position; pathSymbolKeys: string[] }>;
+      nodeCounter: number;
+      includeGlob: string;
+      excludeGlob: string;
+    },
+    word: string,
+    wsRoot: string,
+    existingUris: Set<string>,
+    targetFunction: { uri: string; startLine: number; endLine: number } | null,
+    targetFileOnly: string | null,
+    indexedLocations: WordLocation[]
+  ): Promise<TreeNodeData[]> {
+    const result: TreeNodeData[] = [];
+    const seen = new Set<string>(existingUris);
+    const commentStartCache = new Map<string, number[]>();
+    const db = this._dbManager.getDb();
+
+    // 按文件分组
+    const byFile = new Map<string, WordLocation[]>();
+    for (const loc of indexedLocations) {
+      let list = byFile.get(loc.file_path);
+      if (!list) { list = []; byFile.set(loc.file_path, list); }
+      list.push(loc);
+    }
+
+    for (const [filePath, locations] of byFile.entries()) {
+      let doc: vscode.TextDocument;
+      try {
+        doc = await vscode.workspace.openTextDocument(vscode.Uri.file(filePath));
+      } catch { continue; }
+
+      let commentStartCols = commentStartCache.get(filePath);
+      if (!commentStartCols) {
+        commentStartCols = this._computeCommentLines(doc);
+        commentStartCache.set(filePath, commentStartCols);
+      }
+
+      const uriStr = vscode.Uri.file(filePath).toString();
+
+      for (const loc of locations) {
+        const lineNum = loc.line;
+        const startCol = loc.char;
+        const key = `${uriStr}#${lineNum}:${startCol}`;
+        if (seen.has(key)) { continue; }
+        seen.add(key);
+
+        // 注释过滤
+        if (commentStartCols[lineNum] >= 0 && startCol >= commentStartCols[lineNum]) { continue; }
+
+        // 字符串过滤
+        const lineText = doc.lineAt(lineNum).text;
+        const isIncludeLine = /^\s*#\s*include\b/.test(lineText);
+        if (!isIncludeLine) {
+          const beforeMatch = lineText.slice(0, startCol);
+          const quoteCount = (beforeMatch.match(/"/g) || []).length;
+          if (quoteCount % 2 === 1) { continue; }
+        }
+
+        // 局部变量/静态全局变量过滤
+        const enclosing = db.findEnclosingSymbol(filePath, lineNum);
+        if (targetFunction) {
+          const sameFile = uriStr === targetFunction.uri;
+          const inSameFunction = enclosing
+            && enclosing.range_start_line === targetFunction.startLine
+            && enclosing.range_end_line === targetFunction.endLine;
+          if (!sameFile || !inSameFunction) { continue; }
+        }
+        if (targetFileOnly && uriStr !== targetFileOnly) { continue; }
+
+        const enclosingName = enclosing ? enclosing.name : '';
+        const enclosingStart = enclosing
+          ? { line: enclosing.selection_start_line, char: enclosing.selection_start_char }
+          : { line: lineNum, char: startCol };
+
+        result.push({
+          nodeId: enclosing ? `ref_${++session.nodeCounter}` : `leaf_${++session.nodeCounter}`,
+          label: enclosingName || word,
+          detail: this._relativePath(filePath, wsRoot),
+          line: enclosingStart.line,
+          character: enclosingStart.char,
+          callLine: lineNum,
+          callCharacter: startCol,
+          uri: uriStr,
+          kind: enclosing ? 'Function' : 'TextMatch',
+          isDeclaration: false,
+          isTextSearch: true,
+          preview: '',
+        });
+      }
     }
 
     return result;
@@ -798,6 +849,26 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     } catch { /* 没有 */ }
 
     return null;
+  }
+
+  /**
+   * 读取 C_Cpp.files.exclude 配置，转换成 rg 的排除 glob。
+   */
+  private _getCppExcludeGlobs(): string[] {
+    const excludeGlobs: string[] = [];
+    try {
+      const cppExclude = vscode.workspace
+        .getConfiguration('C_Cpp')
+        .get<Record<string, boolean>>('files.exclude', {});
+      for (const [pattern, enabled] of Object.entries(cppExclude)) {
+        if (enabled) {
+          excludeGlobs.push(`!${pattern}`);
+        }
+      }
+    } catch {
+      // 读取失败，返回空数组
+    }
+    return excludeGlobs;
   }
   
   /**

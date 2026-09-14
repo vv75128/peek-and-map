@@ -22,10 +22,7 @@
     "theme": "dark"
   },
   "activationEvents": [
-    "onStartupFinished",
-	"onView:peekView.view",
-    "onView:mapView.view",
-	"onView:symbolSearch.view"
+    "onStartupFinished"
   ],
   "extensionKind": [
     "ui",
@@ -90,7 +87,15 @@
       {
         "command": "symbolSearch.reveal",
         "title": "Peek and Map: Show Symbol Search"
-      }
+      },
+      {
+      "command": "peek-and-map.reindexAll",
+      "title": "Peek and Map: 全量重建索引"
+      },
+      {
+      "command": "peek-and-map.reindexChanged",
+      "title": "Peek and Map: 增量索引（仅修改过的文件）"
+       }
     ],
     "configuration": {
       "title": "Peek and Map",

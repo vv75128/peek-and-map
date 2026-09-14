@@ -115,6 +115,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       vscode.commands.executeCommand('symbolSearch.view.focus');
     })
   );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('peek-and-map.reindexAll', async () => {
+      await dbManager.reindexAll();
+      vscode.window.showInformationMessage('Peek and Map：全量索引完成');
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('peek-and-map.reindexChanged', async () => {
+      const count = await dbManager.reindexChanged();
+      vscode.window.showInformationMessage(`Peek and Map：增量索引完成，更新了 ${count} 个文件`);
+    })
+  );
 }
 
 export function deactivate(): void {}
