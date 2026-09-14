@@ -34,6 +34,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
   private _autoAnalyzeTimer?: NodeJS.Timeout;
   private _isLocked = false;
   private _textSearchCache = new Map<string, TreeNodeData[]>();
+  private _memberDefCache = new Map<string, { uri: string; line: number } | null>();
 
   constructor(
     private readonly _extensionUri: vscode.Uri,
@@ -506,17 +507,45 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     // - 所有 LSP 引用都在同一文件内，但跨函数 → 静态全局变量
     let targetFunction: { uri: string; startLine: number; endLine: number } | null = null;
     let targetFileOnly: string | null = null;
-    if (targetSymbol
+    let targetScope: { uri: string; startLine: number; endLine: number } | null = null;
+
+    // 先对光标位置调定义跳转，看它是否跳到某个作用域类符号内
+    try {
+      const cursorDefs = await vscode.commands.executeCommand<vscode.Location[]>(
+        'vscode.executeDefinitionProvider', uri, pos
+      );
+      if (cursorDefs && cursorDefs.length > 0) {
+        const defLoc = cursorDefs[0];
+        const defSymbols = await this._getDocumentSymbols(defLoc.uri);
+        const defWithAncestors = this._deepestContainingWithAncestors(defSymbols, defLoc.range.start);
+        const scopeAncestor = defWithAncestors?.ancestors.find(a =>
+          a.kind === vscode.SymbolKind.Struct ||
+          a.kind === vscode.SymbolKind.Class ||
+          a.kind === vscode.SymbolKind.Interface ||
+          a.kind === vscode.SymbolKind.Namespace ||
+          a.kind === vscode.SymbolKind.Enum
+        );
+        if (scopeAncestor) {
+          targetScope = {
+            uri: defLoc.uri.toString(),
+            startLine: scopeAncestor.range.start.line,
+            endLine: scopeAncestor.range.end.line,
+          };
+        }
+      }
+    } catch { /* 忽略 */ }
+
+    if (!targetScope && targetSymbol
         && this._simpleSymbolName(targetSymbol.name) !== word) {
       if (locs.length > 0) {
-        // 用 LSP 结果判断是局部变量还是静态全局变量
+        const allInSameFile = locs.every(loc =>
+          loc.uri.toString() === uri.toString()
+        );
+
         const allInSameFunction = locs.every(loc =>
           loc.uri.toString() === uri.toString() &&
           loc.range.start.line >= targetSymbol!.range.start.line &&
           loc.range.start.line <= targetSymbol!.range.end.line
-        );
-        const allInSameFile = locs.every(loc =>
-          loc.uri.toString() === uri.toString()
         );
 
         if (allInSameFunction) {
@@ -529,8 +558,6 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
           targetFileOnly = uri.toString();
         }
       } else {
-        // LSP 返回空，无法判断作用域，保守起见按局部变量处理
-        // （只保留当前函数内的匹配，避免其他函数的同名参数误报）
         if (this._isFunctionLikeSymbol(targetSymbol.kind)) {
           targetFunction = {
             uri: uri.toString(),
@@ -539,11 +566,10 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
           };
         }
       }
-    }
-	
-    for (const loc of locs) {
-      if (!this._passesFileFilter(loc.uri, session.includeGlob, session.excludeGlob)) {
-        continue;
+    }   
+      for (const loc of locs) {
+        if (!this._passesFileFilter(loc.uri, session.includeGlob, session.excludeGlob)) {
+          continue;
       }
 
       let refDoc: vscode.TextDocument;
@@ -643,7 +669,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     for (const loc of locs) {
       existingUris.add(`${loc.uri.toString()}#${loc.range.start.line}:${loc.range.start.character}`);
     }
-    const textResults = await this._resolveByTextSearch(session, word, wsRoot, existingUris, targetFunction, targetFileOnly);
+    const textResults = await this._resolveByTextSearch(session, word, wsRoot, existingUris, targetFunction, targetFileOnly, targetScope);
     result.push(...textResults);
 
     // 按文件路径 + 行号排序
@@ -671,7 +697,8 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     wsRoot: string,
     existingUris: Set<string>,
     targetFunction: { uri: string; startLine: number; endLine: number } | null,
-    targetFileOnly: string | null
+    targetFileOnly: string | null,
+    targetScope: { uri: string; startLine: number; endLine: number } | null
   ): Promise<TreeNodeData[]> {
     if (!word) { return []; }
 
@@ -680,7 +707,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     const indexedLocations = db.findWordLocations(word);
     if (indexedLocations.length > 0) {
       return this._resolveFromIndex(
-        session, word, wsRoot, existingUris, targetFunction, targetFileOnly, indexedLocations
+        session, word, wsRoot, existingUris, targetFunction, targetFileOnly, targetScope, indexedLocations
       );
     }
 
@@ -783,6 +810,13 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
 
           if (targetFileOnly && uriStr !== targetFileOnly) { continue; }
 
+          if (targetScope) {
+            const sameFile = uriStr === targetScope.uri;
+            if (!sameFile) { continue; }
+            const inScope = await this._isDefinitionInScope(filePath, lineNum, startCol, targetScope);
+            if (!inScope) { continue; }
+          }
+
           const enclosingName = enclosing ? enclosing.name : '';
           const enclosingStart = enclosing
             ? { line: enclosing.selection_start_line, char: enclosing.selection_start_char }
@@ -834,6 +868,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     existingUris: Set<string>,
     targetFunction: { uri: string; startLine: number; endLine: number } | null,
     targetFileOnly: string | null,
+    targetScope: { uri: string; startLine: number; endLine: number } | null,
     indexedLocations: WordLocation[]
   ): Promise<TreeNodeData[]> {
     const result: TreeNodeData[] = [];
@@ -903,6 +938,13 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
         }
         if (targetFileOnly && uriStr !== targetFileOnly) { continue; }
 
+        if (targetScope) {
+          const sameFile = uriStr === targetScope.uri;
+          if (!sameFile) { continue; }
+          const inScope = await this._isDefinitionInScope(filePath, lineNum, startCol, targetScope);
+          if (!inScope) { continue; }
+        }
+
         const enclosingName = enclosing ? enclosing.name : '';
         const enclosingStart = enclosing
           ? { line: enclosing.selection_start_line, char: enclosing.selection_start_char }
@@ -926,6 +968,63 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     }
 
     return result;
+  }
+
+  /**
+   * 对匹配位置调定义跳转，返回定义位置（用于判断结构体成员归属）。
+   * 结果缓存，避免重复调用。
+   */
+  private async _resolveMemberDefinition(
+    filePath: string,
+    line: number,
+    char: number
+  ): Promise<{ uri: string; line: number } | null> {
+    const key = `${filePath}#${line}:${char}`;
+    if (this._memberDefCache.has(key)) {
+      return this._memberDefCache.get(key)!;
+    }
+
+    let result: { uri: string; line: number } | null = null;
+    try {
+      const defs = await vscode.commands.executeCommand<vscode.Location[]>(
+        'vscode.executeDefinitionProvider',
+        vscode.Uri.file(filePath),
+        new vscode.Position(line, char)
+      );
+      console.log('[MEMBER] 定义跳转:', filePath, line + 1, char, '结果:', defs?.map(d => `${d.uri.fsPath}:${d.range.start.line + 1}`));
+      if (defs && defs.length > 0) {
+        result = {
+          uri: defs[0].uri.toString(),
+          line: defs[0].range.start.line,
+        };
+      }
+    } catch (e) {
+      console.log('[MEMBER] 定义跳转失败:', e);
+    }
+
+    if (this._memberDefCache.size > 500) {
+      const firstKey = this._memberDefCache.keys().next().value;
+      if (firstKey !== undefined) {
+        this._memberDefCache.delete(firstKey);
+      }
+    }
+    this._memberDefCache.set(key, result);
+    return result;
+  }
+
+  /**
+   * 判断定义位置是否在指定的作用域范围内。
+   */
+  private async _isDefinitionInScope(
+    filePath: string,
+    line: number,
+    char: number,
+    scope: { uri: string; startLine: number; endLine: number }
+  ): Promise<boolean> {
+    const def = await this._resolveMemberDefinition(filePath, line, char);
+    if (!def) { return false; }
+    if (def.uri !== scope.uri) { return false; }
+    return def.line >= scope.startLine && def.line <= scope.endLine;
   }
 
   private async _findRipgrep(): Promise<string | null> {
