@@ -8,16 +8,41 @@ const execFileAsync = promisify(execFile);
 export class SymbolIndexer {
   constructor(private db: SymbolDatabase) {}
 
+  /**
+   * 读取 C_Cpp.files.exclude 配置，返回排除模式数组。
+   */
+  private _getCppExcludePatterns(): string[] {
+    const patterns: string[] = ['**/node_modules/**'];
+    try {
+      const cppExclude = vscode.workspace
+        .getConfiguration('C_Cpp')
+        .get<Record<string, boolean>>('files.exclude', {});
+      for (const [pattern, enabled] of Object.entries(cppExclude)) {
+        if (enabled) {
+          patterns.push(pattern);
+        }
+      }
+    } catch { /* 忽略 */ }
+    return patterns;
+  }
+
+  /**
+   * 转成 findFiles 的 exclude glob（{} 包裹多个模式）。
+   */
+  private _getCppExcludeGlob(): string {
+    return `{${this._getCppExcludePatterns().join(',')}}`;
+  }
+
   async indexWorkspace(
     onProgress?: (done: number, total: number, currentFile: string) => void
   ): Promise<void> {
     const files = await vscode.workspace.findFiles(
       '**/*.{c,h,cpp,hpp,cc,cxx,hxx}',
-      '**/node_modules/**'
+      this._getCppExcludeGlob()
     );
     const total = files.length;
     let done = 0;
-    const concurrency = 8;
+    const concurrency = 6;
 
     for (let i = 0; i < files.length; i += concurrency) {
       const batch = files.slice(i, i + concurrency);
@@ -47,7 +72,24 @@ export class SymbolIndexer {
         this.db.insertSymbols(records);
       }
 
-      // 倒排索引由 buildWordIndex 统一构建，这里不处理
+      // 倒排索引：按文件更新
+      this.db.clearWordIndexForFile(uri.fsPath);
+      const wordRegex = /\b[A-Za-z_][A-Za-z0-9_]*\b/g;
+      const wordLocations = new Map<string, WordLocation[]>();
+      for (let i = 0; i < doc.lineCount; i++) {
+        const lineText = doc.lineAt(i).text;
+        let match: RegExpExecArray | null;
+        wordRegex.lastIndex = 0;
+        while ((match = wordRegex.exec(lineText)) !== null) {
+          const word = match[0];
+          let list = wordLocations.get(word);
+          if (!list) { list = []; wordLocations.set(word, list); }
+          list.push({ file_path: uri.fsPath, line: i, char: match.index });
+        }
+      }
+      for (const [word, locs] of wordLocations.entries()) {
+        this.db.addWordLocations(word, locs);
+      }
     } catch {
       // 忽略无法解析的文件
     }
@@ -59,7 +101,7 @@ export class SymbolIndexer {
   ): Promise<number> {
     const files = await vscode.workspace.findFiles(
       '**/*.{c,h,cpp,hpp,cc,cxx,hxx}',
-      '**/node_modules/**'
+      this._getCppExcludeGlob()
     );
 
     // 当前工作区里存在的文件路径集合
@@ -108,11 +150,13 @@ export class SymbolIndexer {
     wsRoot: string,
     onProgress?: (done: number, total: number, currentFile: string) => void
   ): Promise<void> {
+    const excludePatterns = this._getCppExcludePatterns();
     const args = [
       '--json',
       '-o',
       '-e', '\\b[A-Za-z_][A-Za-z0-9_]*\\b',
-      '-g', '*.{c,h,cpp,hpp,cc,cxx,hxx}',
+      '--glob', '*.{c,h,cpp,hpp,cc,cxx,hxx}',
+      ...excludePatterns.flatMap(p => ['--glob', `!${p}`]),
       wsRoot,
     ];
 

@@ -646,6 +646,17 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     const textResults = await this._resolveByTextSearch(session, word, wsRoot, existingUris, targetFunction, targetFileOnly);
     result.push(...textResults);
 
+    // 按文件路径 + 行号排序
+    result.sort((a, b) => {
+      if (a.uri !== b.uri) { return a.uri.localeCompare(b.uri); }
+      const lineA = a.callLine != null ? a.callLine : a.line;
+      const lineB = b.callLine != null ? b.callLine : b.line;
+      if (lineA !== lineB) { return lineA - lineB; }
+      const charA = a.callCharacter != null ? a.callCharacter : a.character;
+      const charB = b.callCharacter != null ? b.callCharacter : b.character;
+      return charA - charB;
+    });
+
     return result;
   }
 
@@ -682,6 +693,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     const result: TreeNodeData[] = [];
     const seen = new Set<string>(existingUris);
     const commentStartCache = new Map<string, number[]>();
+    const inactiveCache = new Map<string, boolean[]>();
 
     try {
       const rgPath = await this._findRipgrep();
@@ -706,9 +718,91 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       }
 
       const lines = stdout.split('\n').filter(Boolean);
+      const db = this._dbManager.getDb();
 
       for (const line of lines) {
-        // ... 解析和处理逻辑不变 ...
+        let match: any;
+        try { match = JSON.parse(line); } catch { continue; }
+        if (match.type !== 'match') { continue; }
+
+        const data = match.data;
+        if (!data || !data.path || !data.line_number) { continue; }
+
+        const filePath = data.path.text;
+        const lineNum = data.line_number - 1;
+        const uriStr = vscode.Uri.file(filePath).toString();
+        const submatches = data.submatches || [];
+
+        let doc: vscode.TextDocument | undefined;
+        try {
+          doc = await vscode.workspace.openTextDocument(vscode.Uri.file(filePath));
+        } catch { continue; }
+
+        let commentStartCols = commentStartCache.get(filePath);
+        if (!commentStartCols) {
+          commentStartCols = this._computeCommentLines(doc);
+          commentStartCache.set(filePath, commentStartCols);
+        }
+
+        let inactiveLines = inactiveCache.get(filePath);
+        if (!inactiveLines) {
+          inactiveLines = this._computeInactiveLines(doc);
+          inactiveCache.set(filePath, inactiveLines);
+        }
+
+        for (const submatch of submatches) {
+          const startCol = submatch.start;
+          const key = `${uriStr}#${lineNum}:${startCol}`;
+          if (seen.has(key)) { continue; }
+          seen.add(key);
+
+          // 排除注释里的匹配
+          if (commentStartCols[lineNum] >= 0 && startCol >= commentStartCols[lineNum]) { continue; }
+
+          // 排除 #if 0 块里的匹配
+          if (inactiveLines[lineNum]) { continue; }
+
+          // 排除字符串字面量里的匹配（#include 行除外）
+          const lineText = doc.lineAt(lineNum).text;
+          const isIncludeLine = /^\s*#\s*include\b/.test(lineText);
+          if (!isIncludeLine) {
+            const beforeMatch = lineText.slice(0, startCol);
+            const quoteCount = (beforeMatch.match(/"/g) || []).length;
+            if (quoteCount % 2 === 1) { continue; }
+          }
+
+          const enclosing = db.findEnclosingSymbol(filePath, lineNum);
+
+          if (targetFunction) {
+            const sameFile = uriStr === targetFunction.uri;
+            const inSameFunction = enclosing
+              && enclosing.range_start_line === targetFunction.startLine
+              && enclosing.range_end_line === targetFunction.endLine;
+            if (!sameFile || !inSameFunction) { continue; }
+          }
+
+          if (targetFileOnly && uriStr !== targetFileOnly) { continue; }
+
+          const enclosingName = enclosing ? enclosing.name : '';
+          const enclosingStart = enclosing
+            ? { line: enclosing.selection_start_line, char: enclosing.selection_start_char }
+            : { line: lineNum, char: startCol };
+
+          result.push({
+            nodeId: enclosing ? `ref_${++session.nodeCounter}` : `leaf_${++session.nodeCounter}`,
+            label: enclosingName || word,
+            detail: this._relativePath(filePath, wsRoot),
+            line: enclosingStart.line,
+            character: enclosingStart.char,
+            callLine: lineNum,
+            callCharacter: startCol,
+            uri: uriStr,
+            kind: enclosing ? 'Function' : 'TextMatch',
+            isDeclaration: false,
+            isTextSearch: true,
+            preview: '',
+          });
+        }
       }
     } catch {
       // rg 不可用，静默返回
@@ -745,6 +839,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     const result: TreeNodeData[] = [];
     const seen = new Set<string>(existingUris);
     const commentStartCache = new Map<string, number[]>();
+    const inactiveCache = new Map<string, boolean[]>();
     const db = this._dbManager.getDb();
 
     // 按文件分组
@@ -767,6 +862,12 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
         commentStartCache.set(filePath, commentStartCols);
       }
 
+      let inactiveLines = inactiveCache.get(filePath);
+      if (!inactiveLines) {
+        inactiveLines = this._computeInactiveLines(doc);
+        inactiveCache.set(filePath, inactiveLines);
+      }
+
       const uriStr = vscode.Uri.file(filePath).toString();
 
       for (const loc of locations) {
@@ -778,6 +879,9 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
 
         // 注释过滤
         if (commentStartCols[lineNum] >= 0 && startCol >= commentStartCols[lineNum]) { continue; }
+
+        // #if 0 过滤
+        if (inactiveLines[lineNum]) { continue; }
 
         // 字符串过滤
         const lineText = doc.lineAt(lineNum).text;
@@ -913,6 +1017,35 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     }
 
     return commentStartCols;
+  }
+
+  /**
+   * 扫描整个文件，返回每一行是否在 #if 0 块中。
+   * 只处理 #if 0 和 #endif 的简单配对，不处理嵌套和 #else。
+   */
+  private _computeInactiveLines(doc: vscode.TextDocument): boolean[] {
+    const lines = doc.lineCount;
+    const inactive: boolean[] = new Array(lines).fill(false);
+    let depth = 0;
+
+    for (let i = 0; i < lines; i++) {
+      const text = doc.lineAt(i).text.trim();
+
+      if (/^\s*#\s*if\s+0\b/.test(text)) {
+        depth++;
+        inactive[i] = true;
+        continue;
+      }
+
+      if (depth > 0) {
+        inactive[i] = true;
+        if (/^\s*#\s*endif\b/.test(text)) {
+          depth--;
+        }
+      }
+    }
+
+    return inactive;
   }
   // ── Expand: Reference hierarchy ────────────────────────────────────────────
 

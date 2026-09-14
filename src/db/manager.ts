@@ -14,6 +14,7 @@ export class DatabaseManager {
   private initialized = false;
   private _progressItem: vscode.StatusBarItem;
   private _storageFile!: string;
+  private _reindexing = false;
 
   constructor(private context: vscode.ExtensionContext) {
     this.db = new SymbolDatabase();
@@ -91,6 +92,7 @@ export class DatabaseManager {
       })();
     }
 
+    // VS Code 内保存文件时更新
     vscode.workspace.onDidSaveTextDocument(async (doc) => {
       if (/\.(c|h|cpp|hpp|cc|cxx|hxx)$/.test(doc.fileName)) {
         await this.indexer.indexFile(doc.uri);
@@ -98,6 +100,32 @@ export class DatabaseManager {
         await this._saveToDisk();
       }
     });
+
+    // ── 外部修改文件时自动增量索引（防抖 3 秒） ──
+    let externalIndexTimer: NodeJS.Timeout | undefined;
+    const watcher = vscode.workspace.createFileSystemWatcher(
+      '**/*.{c,h,cpp,hpp,cc,cxx,hxx}'
+    );
+
+    const scheduleExternalIndex = () => {
+      if (externalIndexTimer) { clearTimeout(externalIndexTimer); }
+      externalIndexTimer = setTimeout(async () => {
+        try {
+          const count = await this.reindexChanged();
+          if (count > 0) {
+            console.log(`[DB] 外部修改自动增量索引：更新了 ${count} 个文件`);
+          }
+        } catch (e) {
+          console.warn('[DB] 外部修改自动索引失败', e);
+        }
+      }, 3000);
+    };
+
+    watcher.onDidChange(scheduleExternalIndex);
+    watcher.onDidCreate(scheduleExternalIndex);
+    watcher.onDidDelete(scheduleExternalIndex);
+
+    this.context.subscriptions.push(watcher);
   }
 
   /** 全量重建索引 */
@@ -146,27 +174,33 @@ export class DatabaseManager {
 
   /** 增量索引：只重新索引修改过的文件，返回更新的文件数 */
   async reindexChanged(): Promise<number> {
-    const since = this.db.getLastIndexedTime();
-    let count = 0;
-    await vscode.window.withProgress({
-      location: vscode.ProgressLocation.Notification,
-      title: 'Peek and Map：增量索引',
-      cancellable: false,
-    }, async (progress) => {
-      let lastPercent = 0;
-      count = await this.indexer.indexChangedFiles(since, (done, total, currentFile) => {
-        const percent = total > 0 ? Math.floor((done / total) * 100) : 0;
-        const increment = percent - lastPercent;
-        lastPercent = percent;
-        progress.report({
-          increment,
-          message: `${done}/${total} (${percent}%)`,
+    if (this._reindexing) { return 0; }
+    this._reindexing = true;
+    try {
+      const since = this.db.getLastIndexedTime();
+      let count = 0;
+      await vscode.window.withProgress({
+        location: vscode.ProgressLocation.Notification,
+        title: 'Peek and Map：增量索引',
+        cancellable: false,
+      }, async (progress) => {
+        let lastPercent = 0;
+        count = await this.indexer.indexChangedFiles(since, (done, total, currentFile) => {
+          const percent = total > 0 ? Math.floor((done / total) * 100) : 0;
+          const increment = percent - lastPercent;
+          lastPercent = percent;
+          progress.report({
+            increment,
+            message: `${done}/${total} (${percent}%)`,
+          });
         });
+        this.db.setLastIndexedTime(Date.now());
+        await this._saveToDisk();
       });
-      this.db.setLastIndexedTime(Date.now());
-      await this._saveToDisk();
-    });
-    return count;
+      return count;
+    } finally {
+      this._reindexing = false;
+    }
   }
 
   private async _findRipgrep(): Promise<string | null> {
