@@ -12,6 +12,7 @@ export class PeekViewProvider implements vscode.WebviewViewProvider {
   private _lastUri?: string;
   private _lastVersion?: number;
   private _lastLine?: number;
+  private _lastChar?: number;
   private _isLocked = false;
 
   // Tracks the last text editor that had focus.
@@ -171,19 +172,22 @@ export class PeekViewProvider implements vscode.WebviewViewProvider {
     const doc = editor.document;
     const cursor = editor.selection.active;
     const cursorLine = cursor.line;
+    const cursorChar = cursor.character;
 
     // Skip redundant work
     const key = doc.uri.toString();
     if (
       key === this._lastUri &&
       doc.version === this._lastVersion &&
-      cursorLine === this._lastLine
+      cursorLine === this._lastLine &&
+      cursorChar === this._lastChar
     ) {
       return;
     }
     this._lastUri = key;
     this._lastVersion = doc.version;
     this._lastLine = cursorLine;
+    this._lastChar = cursorChar;
 
     // ── Step 1: definition of the symbol UNDER the cursor ─────────────────
     // Core behavior: cursor on `foo()` → show foo's body.
@@ -327,6 +331,7 @@ export class PeekViewProvider implements vscode.WebviewViewProvider {
     this._lastUri = undefined;
     this._lastVersion = undefined;
     this._lastLine = undefined;
+    this._lastChar = undefined;
   }
 
   private _findContext(
