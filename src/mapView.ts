@@ -817,25 +817,34 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
             if (!inScope) { continue; }
           }
 
-          const enclosingName = enclosing ? enclosing.name : '';
-          const enclosingStart = enclosing
-            ? { line: enclosing.selection_start_line, char: enclosing.selection_start_char }
-            : { line: lineNum, char: startCol };
+        const enclosingName = enclosing ? enclosing.name : '';
+        const enclosingStart = enclosing
+          ? { line: enclosing.selection_start_line, char: enclosing.selection_start_char }
+          : { line: lineNum, char: startCol };
 
-          result.push({
-            nodeId: enclosing ? `ref_${++session.nodeCounter}` : `leaf_${++session.nodeCounter}`,
-            label: enclosingName || word,
-            detail: this._relativePath(filePath, wsRoot),
-            line: enclosingStart.line,
-            character: enclosingStart.char,
-            callLine: lineNum,
-            callCharacter: startCol,
-            uri: uriStr,
-            kind: enclosing ? 'Function' : 'TextMatch',
-            isDeclaration: false,
-            isTextSearch: true,
-            preview: '',
-          });
+        const nodeId = enclosing
+          ? this._allocRefNodeId(
+              session,
+              vscode.Uri.file(filePath),
+              new vscode.Position(enclosingStart.line, enclosingStart.char),
+              new Set<string>()
+            )
+          : `leaf_${++session.nodeCounter}`;
+
+        result.push({
+          nodeId,
+          label: enclosingName || word,
+          detail: this._relativePath(filePath, wsRoot),
+          line: enclosingStart.line,
+          character: enclosingStart.char,
+          callLine: lineNum,
+          callCharacter: startCol,
+          uri: uriStr,
+          kind: enclosing ? 'Function' : 'TextMatch',
+          isDeclaration: false,
+          isTextSearch: true,
+          preview: '',
+        });
         }
       }
     } catch {
@@ -945,25 +954,34 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
           if (!inScope) { continue; }
         }
 
-        const enclosingName = enclosing ? enclosing.name : '';
-        const enclosingStart = enclosing
-          ? { line: enclosing.selection_start_line, char: enclosing.selection_start_char }
-          : { line: lineNum, char: startCol };
+          const enclosingName = enclosing ? enclosing.name : '';
+          const enclosingStart = enclosing
+            ? { line: enclosing.selection_start_line, char: enclosing.selection_start_char }
+            : { line: lineNum, char: startCol };
 
-        result.push({
-          nodeId: enclosing ? `ref_${++session.nodeCounter}` : `leaf_${++session.nodeCounter}`,
-          label: enclosingName || word,
-          detail: this._relativePath(filePath, wsRoot),
-          line: enclosingStart.line,
-          character: enclosingStart.char,
-          callLine: lineNum,
-          callCharacter: startCol,
-          uri: uriStr,
-          kind: enclosing ? 'Function' : 'TextMatch',
-          isDeclaration: false,
-          isTextSearch: true,
-          preview: '',
-        });
+          const nodeId = enclosing
+            ? this._allocRefNodeId(
+                session,
+                vscode.Uri.file(filePath),
+                new vscode.Position(enclosingStart.line, enclosingStart.char),
+                new Set<string>()
+              )
+            : `leaf_${++session.nodeCounter}`;
+
+          result.push({
+            nodeId,
+            label: enclosingName || word,
+            detail: this._relativePath(filePath, wsRoot),
+            line: enclosingStart.line,
+            character: enclosingStart.char,
+            callLine: lineNum,
+            callCharacter: startCol,
+            uri: uriStr,
+            kind: enclosing ? 'Function' : 'TextMatch',
+            isDeclaration: false,
+            isTextSearch: true,
+            preview: '',
+          });
       }
     }
 
