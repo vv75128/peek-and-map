@@ -508,6 +508,20 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     let targetFunction: { uri: string; startLine: number; endLine: number } | null = null;
     let targetFileOnly: string | null = null;
     let targetScope: { uri: string; startLine: number; endLine: number } | null = null;
+    let targetDefinition: { uri: string; line: number } | null = null;
+
+    // 对光标位置调定义跳转，拿到目标符号的定义位置
+    try {
+      const defs = await vscode.commands.executeCommand<vscode.Location[]>(
+        'vscode.executeDefinitionProvider', uri, pos
+      );
+      if (defs && defs.length > 0) {
+        targetDefinition = {
+          uri: defs[0].uri.toString(),
+          line: defs[0].range.start.line,
+        };
+      }
+    } catch { /* 忽略 */ }
 
     // 先对光标位置调定义跳转，看它是否跳到某个作用域类符号内
     try {
@@ -669,7 +683,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     for (const loc of locs) {
       existingUris.add(`${loc.uri.toString()}#${loc.range.start.line}:${loc.range.start.character}`);
     }
-    const textResults = await this._resolveByTextSearch(session, word, wsRoot, existingUris, targetFunction, targetFileOnly, targetScope);
+    const textResults = await this._resolveByTextSearch(session, word, wsRoot, existingUris, targetFunction, targetFileOnly, targetScope, targetDefinition);
     result.push(...textResults);
 
     // 按文件路径 + 行号排序
@@ -698,7 +712,8 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     existingUris: Set<string>,
     targetFunction: { uri: string; startLine: number; endLine: number } | null,
     targetFileOnly: string | null,
-    targetScope: { uri: string; startLine: number; endLine: number } | null
+    targetScope: { uri: string; startLine: number; endLine: number } | null,
+    targetDefinition: { uri: string; line: number } | null
   ): Promise<TreeNodeData[]> {
     if (!word) { return []; }
 
@@ -707,7 +722,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     const indexedLocations = db.findWordLocations(word);
     if (indexedLocations.length > 0) {
       return this._resolveFromIndex(
-        session, word, wsRoot, existingUris, targetFunction, targetFileOnly, targetScope, indexedLocations
+        session, word, wsRoot, existingUris, targetFunction, targetFileOnly, targetScope, targetDefinition, indexedLocations
       );
     }
 
@@ -817,6 +832,15 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
             if (!inScope) { continue; }
           }
 
+          // 用定义跳转对比，区分全局变量和结构体成员
+          if (targetDefinition) {
+            const memberDef = await this._resolveMemberDefinition(filePath, lineNum, startCol);
+            if (!memberDef) { continue; }
+            if (memberDef.uri !== targetDefinition.uri || memberDef.line !== targetDefinition.line) {
+              continue;
+            }
+	  }
+
         const enclosingName = enclosing ? enclosing.name : '';
         const enclosingStart = enclosing
           ? { line: enclosing.selection_start_line, char: enclosing.selection_start_char }
@@ -878,6 +902,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     targetFunction: { uri: string; startLine: number; endLine: number } | null,
     targetFileOnly: string | null,
     targetScope: { uri: string; startLine: number; endLine: number } | null,
+    targetDefinition: { uri: string; line: number } | null,
     indexedLocations: WordLocation[]
   ): Promise<TreeNodeData[]> {
     const result: TreeNodeData[] = [];
@@ -954,6 +979,14 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
           if (!inScope) { continue; }
         }
 
+        // 用定义跳转对比，区分全局变量和结构体成员
+        if (targetDefinition) {
+          const memberDef = await this._resolveMemberDefinition(filePath, lineNum, startCol);
+          if (!memberDef) { continue; }
+          if (memberDef.uri !== targetDefinition.uri || memberDef.line !== targetDefinition.line) {
+            continue;
+          }
+        }
           const enclosingName = enclosing ? enclosing.name : '';
           const enclosingStart = enclosing
             ? { line: enclosing.selection_start_line, char: enclosing.selection_start_char }
