@@ -360,7 +360,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       return;
     }
     const word = doc.getText(wordRange);
-    const queryPos = cursor;
+    const queryPos = wordRange.start;
 
     // Clear maps for new search
     session.refNodeMap.clear();
@@ -493,7 +493,10 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       )
       : undefined;
     const targetSimpleName = targetSymbol ? this._simpleSymbolName(targetSymbol.name) : '';
-    const targetIsFunction = !!targetSymbol && this._isFunctionLikeSymbol(targetSymbol.kind);
+    // 只有 targetSymbol 的名字和 word 一致，且是函数时，才算函数
+    const targetIsFunction = !!targetSymbol
+      && this._isFunctionLikeSymbol(targetSymbol.kind)
+      && this._symbolNameMatchesWord(targetSymbol.name, word);
     // 只有 targetSymbol 确实是查询的符号时，才把它加入 pathSymbolKeys
 	const targetMatchesWord = targetSimpleName === word;
 	const pathSymbolKeys = new Set<string>(ancestorPathSymbolKeys);
@@ -510,18 +513,20 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     let targetScope: { uri: string; startLine: number; endLine: number } | null = null;
     let targetDefinition: { uri: string; line: number } | null = null;
 
-    // 对光标位置调定义跳转，拿到目标符号的定义位置
-    try {
-      const defs = await vscode.commands.executeCommand<vscode.Location[]>(
-        'vscode.executeDefinitionProvider', uri, pos
-      );
-      if (defs && defs.length > 0) {
-        targetDefinition = {
-          uri: defs[0].uri.toString(),
-          line: defs[0].range.start.line,
-        };
-      }
-    } catch { /* 忽略 */ }
+    // 只对变量启用 targetDefinition 过滤，函数场景跳过
+    if (!targetIsFunction) {
+      try {
+        const defs = await vscode.commands.executeCommand<vscode.Location[]>(
+          'vscode.executeDefinitionProvider', uri, pos
+        );
+        if (defs && defs.length > 0) {
+          targetDefinition = {
+            uri: defs[0].uri.toString(),
+            line: defs[0].range.start.line,
+          };
+        }
+      } catch { /* 忽略 */ }
+    }
 
     // 先对光标位置调定义跳转，看它是否跳到某个作用域类符号内
     try {
@@ -1042,7 +1047,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
         vscode.Uri.file(filePath),
         new vscode.Position(line, char)
       );
-      console.log('[MEMBER] 定义跳转:', filePath, line + 1, char, '结果:', defs?.map(d => `${d.uri.fsPath}:${d.range.start.line + 1}`));
+
       if (defs && defs.length > 0) {
         result = {
           uri: defs[0].uri.toString(),
@@ -1050,7 +1055,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
         };
       }
     } catch (e) {
-      console.log('[MEMBER] 定义跳转失败:', e);
+
     }
 
     if (this._memberDefCache.size > 500) {
