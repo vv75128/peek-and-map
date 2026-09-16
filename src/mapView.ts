@@ -410,6 +410,24 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
+    // ── 数字常量拦截：纯数字 / 十六进制 / 带后缀的数字直接跳过 ──
+    // 匹配：十进制(123)、十六进制(0xff)、八进制(0o77)、二进制(0b101)、
+    //       浮点数(3.14、.5、1e10)、以及 u/U/l/L/f/F/ll/ULL 等后缀
+    if (/^(0x[0-9a-fA-F]+|0o[0-7]+|0b[01]+|\d*\.\d+(?:[eE][+-]?\d+)?|\d+[eE][+-]?\d+|\d+)[uUlLfF]*$/.test(word)) {
+      this._view.webview.postMessage({ type: 'loading', symbolName: word, instanceId });
+      this._sendEmpty(`"${word}" 是数字常量，不做引用分析`, instanceId);
+      return;
+    }
+
+    // ── 点击位置在注释里，跳过分析 ──
+    const commentCols = this._computeCommentLines(doc);
+    const lineCommentCol = commentCols[queryPos.line];
+    if (lineCommentCol >= 0 && queryPos.character >= lineCommentCol) {
+      this._view.webview.postMessage({ type: 'loading', symbolName: '', instanceId });
+      this._sendEmpty('光标在注释中，不做引用分析', instanceId);
+      return;
+    }
+
     // ── 搜索令牌：新搜索作废之前所有未完成的搜索 ──
     const mySearchId = ++this._searchGen;
     // 中断正在跑的旧 rg execFile
