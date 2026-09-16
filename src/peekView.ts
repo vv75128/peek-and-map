@@ -502,7 +502,8 @@ export class PeekViewProvider implements vscode.WebviewViewProvider {
       if (seen.has(key)) { continue; }
       seen.add(key);
 
-      const ctx = await this._getContextFromLocation(defUri, focusPos);
+      const ctx = await this._getContextFromLocation(defUri, focusPos, true);
+
       if (ctx) {
         contexts.push(ctx);
       }

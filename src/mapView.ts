@@ -17,6 +17,42 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
   private static readonly GRAPH_DIRECTION_STATE_KEY = 'mapView.graphDirection';
   private static readonly DEFAULT_INSTANCE_ID = '__default__';
 
+  /** 高频关键字/基本类型/预处理指令 —— 点击时不做引用搜索，直接返回空 */
+  private static readonly BORING_WORDS = new Set<string>([
+    // C 关键字
+    'auto', 'break', 'case', 'const', 'continue', 'default', 'do', 'else',
+    'enum', 'extern', 'for', 'goto', 'if', 'inline', 'register', 'return',
+    'signed', 'sizeof', 'static', 'struct', 'switch', 'typedef', 'union',
+    'unsigned', 'volatile', 'while', 'restrict', '_Noreturn', '_Static_assert',
+    '_Alignas', '_Alignof', '_Atomic', '_Bool', '_Complex', '_Generic',
+    '_Imaginary',
+    // C++ 关键字（常见）
+    'class', 'public', 'private', 'protected', 'namespace', 'using',
+    'template', 'typename', 'virtual', 'override', 'final', 'new', 'delete',
+    'this', 'friend', 'explicit', 'mutable', 'operator', 'throw', 'try',
+    'catch', 'constexpr', 'noexcept', 'decltype', 'nullptr',
+    // 基本类型
+    'int', 'char', 'short', 'long', 'float', 'double', 'void', 'bool',
+    'true', 'false', 'NULL', 'null',
+    // stdint 固定宽度类型
+    'uint8_t', 'uint16_t', 'uint32_t', 'uint64_t',
+    'int8_t', 'int16_t', 'int32_t', 'int64_t',
+    'uint_least8_t', 'uint_least16_t', 'uint_least32_t', 'uint_least64_t',
+    'int_least8_t', 'int_least16_t', 'int_least32_t', 'int_least64_t',
+    'uint_fast8_t', 'uint_fast16_t', 'uint_fast32_t', 'uint_fast64_t',
+    'int_fast8_t', 'int_fast16_t', 'int_fast32_t', 'int_fast64_t',
+    'uintptr_t', 'intptr_t', 'size_t', 'ssize_t', 'ptrdiff_t',
+    'wchar_t', 'char16_t', 'char32_t',
+    // 裸前缀（无 _t 后缀的常见写法）
+    'uint8', 'uint16', 'uint32', 'uint64',
+    'int8', 'int16', 'int32', 'int64',
+    // 预处理指令里的词（点击 #define 时 getWordRangeAtPosition 会取到 define）
+    'define', 'ifdef', 'ifndef', 'endif', 'elif',
+    'include', 'pragma', 'undef', 'error', 'warning', 'line',
+    // 其他高频宏
+    'assert', 'offsetof',
+  ]);
+
   private _view?: vscode.WebviewView;
   private _lastKnownEditor?: vscode.TextEditor;
 
@@ -35,6 +71,11 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
   private _isLocked = false;
   private _textSearchCache = new Map<string, TreeNodeData[]>();
   private _memberDefCache = new Map<string, { uri: string; line: number } | null>();
+
+  /** 搜索令牌：每次新搜索自增，用于旧搜索的竞态取消 */
+  private _searchGen = 0;
+  /** 当前活跃的 rg 子进程（execFile 不支持直接 kill，这里保留 AbortController 以便中断） */
+  private _activeRgAbort: AbortController | null = null;
 
   constructor(
     private readonly _extensionUri: vscode.Uri,
@@ -362,6 +403,21 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     const word = doc.getText(wordRange);
     const queryPos = wordRange.start;
 
+    // ── 无聊词拦截：关键字/基本类型/预处理指令直接返回，避免 rg 搜爆 ──
+    if (MapViewProvider.BORING_WORDS.has(word)) {
+      this._view.webview.postMessage({ type: 'loading', symbolName: word, instanceId });
+      this._sendEmpty(`"${word}" 是关键字/基本类型，不做引用分析`, instanceId);
+      return;
+    }
+
+    // ── 搜索令牌：新搜索作废之前所有未完成的搜索 ──
+    const mySearchId = ++this._searchGen;
+    // 中断正在跑的旧 rg execFile
+    if (this._activeRgAbort) {
+      try { this._activeRgAbort.abort(); } catch (_) { /* ignore */ }
+      this._activeRgAbort = null;
+    }
+
     // Clear maps for new search
     session.refNodeMap.clear();
     session.nodeCounter = 0;
@@ -372,7 +428,9 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
 
     // ── References hierarchy (first level) ─────────────────────────────────
-    const refNodes = await this._resolveReferencingSymbols(session, doc.uri, queryPos, wsRoot, word);
+    const refNodes = await this._resolveReferencingSymbols(session, doc.uri, queryPos, wsRoot, word, new Set<string>(), mySearchId);
+    // 竞态检查：已被新搜索取代则丢弃结果
+    if (mySearchId !== this._searchGen) { return; }
 
     // Resolve current symbol + optional owning class for root label/kind
     let rootKind = '';
@@ -401,6 +459,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
         const items = await vscode.commands.executeCommand<vscode.CallHierarchyItem[]>(
           'vscode.prepareCallHierarchy', doc.uri, queryPos
         );
+        if (mySearchId !== this._searchGen) { return; }
         if (items && items.length > 0) {
           const matched = items.find((it) => this._symbolNameMatchesWord(it.name, word));
           if (matched) {
@@ -415,6 +474,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       rootKind = 'Variable';
     }
 
+    if (mySearchId !== this._searchGen) { return; }
     this._view.webview.postMessage({
       type: 'update',
       instanceId,
@@ -459,17 +519,23 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     pos: vscode.Position,
     wsRoot: string,
     word: string,
-    ancestorPathSymbolKeys: Set<string> = new Set<string>()
+    ancestorPathSymbolKeys: Set<string> = new Set<string>(),
+    searchToken: number = -1
   ): Promise<TreeNodeData[]> {
+    // 竞态检查辅助：若 searchToken 有效且已过期，返回空
+    const isStale = () => searchToken >= 0 && searchToken !== this._searchGen;
+
     let locs: vscode.Location[] | undefined;
     try {
       locs = await vscode.commands.executeCommand<vscode.Location[]>(
         'vscode.executeReferenceProvider', uri, pos
       );
     } catch { /* no reference provider */ }
+    if (isStale()) { return []; }
     if (!locs) { locs = []; }
 
     const targetSymbols = await this._getDocumentSymbols(uri);
+    if (isStale()) { return []; }
     const targetSymbol = this._deepestContaining(targetSymbols, pos);
     const targetSymStart = targetSymbol?.selectionRange.start;
     let targetDoc: vscode.TextDocument | undefined;
@@ -478,6 +544,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     } catch {
       targetDoc = undefined;
     }
+    if (isStale()) { return []; }
     const targetIsDeclaration = !!(targetSymbol && targetDoc && this._isFunctionDeclarationSymbol(targetSymbol, targetDoc));
     const targetWithAncestors = targetSymStart
       ? this._findBySelectionStartWithAncestors(targetSymbols, targetSymStart)
@@ -526,6 +593,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
           };
         }
       } catch { /* 忽略 */ }
+      if (isStale()) { return []; }
     }
 
     // 先对光标位置调定义跳转，看它是否跳到某个作用域类符号内
@@ -552,6 +620,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
           };
         }
       }
+      if (isStale()) { return []; }
     } catch { /* 忽略 */ }
 
     if (!targetScope && targetSymbol
@@ -595,8 +664,10 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       try {
         refDoc = await vscode.workspace.openTextDocument(loc.uri);
       } catch { continue; }
+      if (isStale()) { break; }
 
       const symbols = await this._getDocumentSymbols(loc.uri);
+      if (isStale()) { break; }
       const enclosing = this._deepestContaining(symbols, loc.range.start);
 
       if (!enclosing) {
@@ -684,11 +755,13 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     }
 
     // ── 始终补充文本搜索，用过滤条件控制误报 ──
+    if (isStale()) { return []; }
     const existingUris = new Set<string>();
     for (const loc of locs) {
       existingUris.add(`${loc.uri.toString()}#${loc.range.start.line}:${loc.range.start.character}`);
     }
-    const textResults = await this._resolveByTextSearch(session, word, wsRoot, existingUris, targetFunction, targetFileOnly, targetScope, targetDefinition);
+    const textResults = await this._resolveByTextSearch(session, word, wsRoot, existingUris, targetFunction, targetFileOnly, targetScope, targetDefinition, searchToken);
+    if (isStale()) { return []; }
     result.push(...textResults);
 
     // 按文件路径 + 行号排序
@@ -718,16 +791,19 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     targetFunction: { uri: string; startLine: number; endLine: number } | null,
     targetFileOnly: string | null,
     targetScope: { uri: string; startLine: number; endLine: number } | null,
-    targetDefinition: { uri: string; line: number } | null
+    targetDefinition: { uri: string; line: number } | null,
+    searchToken: number = -1
   ): Promise<TreeNodeData[]> {
     if (!word) { return []; }
+    const isStale = () => searchToken >= 0 && searchToken !== this._searchGen;
+    if (isStale()) { return []; }
 
     // ── 优先查倒排索引（不读缓存，索引查询本身够快） ──
     const db = this._dbManager.getDb();
     const indexedLocations = db.findWordLocations(word);
     if (indexedLocations.length > 0) {
       return this._resolveFromIndex(
-        session, word, wsRoot, existingUris, targetFunction, targetFileOnly, targetScope, targetDefinition, indexedLocations
+        session, word, wsRoot, existingUris, targetFunction, targetFileOnly, targetScope, targetDefinition, indexedLocations, searchToken
       );
     }
 
@@ -736,6 +812,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     if (this._textSearchCache.has(cacheKey)) {
       return this._textSearchCache.get(cacheKey)!;
     }
+    if (isStale()) { return []; }
 
     const result: TreeNodeData[] = [];
     const seen = new Set<string>(existingUris);
@@ -744,6 +821,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
 
     try {
       const rgPath = await this._findRipgrep();
+      if (isStale()) { return []; }
       if (!rgPath) { return []; }
 
       const excludeGlobs = this._getCppExcludeGlobs();
@@ -756,13 +834,28 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
         wsRoot,
       ];
 
+      // 使用 AbortController 以便新搜索到达时中断 rg 进程
+      const ac = new AbortController();
+      this._activeRgAbort = ac;
       let stdout = '';
       try {
-        const result = await execFileAsync(rgPath, args, { maxBuffer: 10 * 1024 * 1024 });
+        const result = await execFileAsync(rgPath, args, {
+          maxBuffer: 10 * 1024 * 1024,
+          signal: ac.signal,
+        });
         stdout = result.stdout;
       } catch (e: any) {
+        if (e && e.name === 'AbortError') {
+          // 被新搜索中断，直接返回空
+          return [];
+        }
         return result;
+      } finally {
+        if (this._activeRgAbort === ac) {
+          this._activeRgAbort = null;
+        }
       }
+      if (isStale()) { return []; }
 
       const lines = stdout.split('\n').filter(Boolean);
       const db = this._dbManager.getDb();
@@ -784,6 +877,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
         try {
           doc = await vscode.workspace.openTextDocument(vscode.Uri.file(filePath));
         } catch { continue; }
+        if (isStale()) { break; }
 
         let commentStartCols = commentStartCache.get(filePath);
         if (!commentStartCols) {
@@ -834,12 +928,14 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
             const sameFile = uriStr === targetScope.uri;
             if (!sameFile) { continue; }
             const inScope = await this._isDefinitionInScope(filePath, lineNum, startCol, targetScope);
+            if (isStale()) { break; }
             if (!inScope) { continue; }
           }
 
           // 用定义跳转对比，区分全局变量和结构体成员
           if (targetDefinition) {
             const memberDef = await this._resolveMemberDefinition(filePath, lineNum, startCol);
+            if (isStale()) { break; }
             if (!memberDef) { continue; }
             if (memberDef.uri !== targetDefinition.uri || memberDef.line !== targetDefinition.line) {
               continue;
@@ -908,8 +1004,10 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     targetFileOnly: string | null,
     targetScope: { uri: string; startLine: number; endLine: number } | null,
     targetDefinition: { uri: string; line: number } | null,
-    indexedLocations: WordLocation[]
+    indexedLocations: WordLocation[],
+    searchToken: number = -1
   ): Promise<TreeNodeData[]> {
+    const isStale = () => searchToken >= 0 && searchToken !== this._searchGen;
     const result: TreeNodeData[] = [];
     const seen = new Set<string>(existingUris);
     const commentStartCache = new Map<string, number[]>();
@@ -929,6 +1027,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       try {
         doc = await vscode.workspace.openTextDocument(vscode.Uri.file(filePath));
       } catch { continue; }
+      if (isStale()) { break; }
 
       let commentStartCols = commentStartCache.get(filePath);
       if (!commentStartCols) {
@@ -981,12 +1080,14 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
           const sameFile = uriStr === targetScope.uri;
           if (!sameFile) { continue; }
           const inScope = await this._isDefinitionInScope(filePath, lineNum, startCol, targetScope);
+          if (isStale()) { break; }
           if (!inScope) { continue; }
         }
 
         // 用定义跳转对比，区分全局变量和结构体成员
         if (targetDefinition) {
           const memberDef = await this._resolveMemberDefinition(filePath, lineNum, startCol);
+          if (isStale()) { break; }
           if (!memberDef) { continue; }
           if (memberDef.uri !== targetDefinition.uri || memberDef.line !== targetDefinition.line) {
             continue;
@@ -1206,6 +1307,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
 
   private async _expandRef(instanceId: string, nodeId: string): Promise<void> {
     if (!this._view) { return; }
+    const mySearchId = this._searchGen; // 展开时不抢占令牌，只检查是否被新搜索作废
     const session = this._getOrCreateSession(instanceId);
     const info = session.refNodeMap.get(nodeId);
     if (!info) {
@@ -1219,8 +1321,10 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       info.position,
       wsRoot,
       '',
-      new Set<string>(info.pathSymbolKeys)
+      new Set<string>(info.pathSymbolKeys),
+      mySearchId
     );
+    if (mySearchId !== this._searchGen) { return; }
     this._view.webview.postMessage({ type: 'children', instanceId, parentNodeId: nodeId, items: children });
   }
 
