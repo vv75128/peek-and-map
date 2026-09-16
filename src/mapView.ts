@@ -779,15 +779,27 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       });
     }
 
-    // ── 始终补充文本搜索，用过滤条件控制误报 ──
-    if (isStale()) { return []; }
-    const existingUris = new Set<string>();
-    for (const loc of locs) {
-      existingUris.add(`${loc.uri.toString()}#${loc.range.start.line}:${loc.range.start.character}`);
+    // ── 判断 LSP 结果是否完整，决定是否补充文本搜索 ──
+    // LSP 引用全部在同一个函数内 → 局部变量/形参，结果已精确，无需索引补充；
+    // 全工程同名异义的其他出现会被倒排索引扫出来，既慢又引入噪音。
+    const lspAllInSameFunction = locs.length > 0 && targetSymbol &&
+      this._simpleSymbolName(targetSymbol.name) !== word &&
+      locs.every(loc =>
+        loc.uri.toString() === uri.toString() &&
+        loc.range.start.line >= targetSymbol.range.start.line &&
+        loc.range.start.line <= targetSymbol.range.end.line
+      );
+
+    if (!lspAllInSameFunction) {
+      if (isStale()) { return []; }
+      const existingUris = new Set<string>();
+      for (const loc of locs) {
+        existingUris.add(`${loc.uri.toString()}#${loc.range.start.line}:${loc.range.start.character}`);
+      }
+      const textResults = await this._resolveByTextSearch(session, word, wsRoot, existingUris, targetFunction, targetFileOnly, targetScope, targetDefinition, searchToken);
+      if (isStale()) { return []; }
+      result.push(...textResults);
     }
-    const textResults = await this._resolveByTextSearch(session, word, wsRoot, existingUris, targetFunction, targetFileOnly, targetScope, targetDefinition, searchToken);
-    if (isStale()) { return []; }
-    result.push(...textResults);
 
     // 按文件路径 + 行号排序
     result.sort((a, b) => {
@@ -1048,6 +1060,21 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     }
 
     for (const [filePath, locations] of byFile.entries()) {
+      const fileUriStr = vscode.Uri.file(filePath).toString();
+
+      // ── 提前按作用域裁剪，跳过无关文件，省掉 openTextDocument ──
+      if (targetFileOnly && fileUriStr !== targetFileOnly) { continue; }
+      if (targetFunction) {
+        if (fileUriStr !== targetFunction.uri) { continue; }
+        // 同一文件下，只保留落在函数行范围内的位置
+        const inRange = locations.filter(loc =>
+          loc.line >= targetFunction!.startLine && loc.line <= targetFunction!.endLine
+        );
+        if (inRange.length === 0) { continue; }
+        byFile.set(filePath, inRange);
+      }
+      if (targetScope && fileUriStr !== targetScope.uri) { continue; }
+
       let doc: vscode.TextDocument;
       try {
         doc = await vscode.workspace.openTextDocument(vscode.Uri.file(filePath));
@@ -1066,7 +1093,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
         inactiveCache.set(filePath, inactiveLines);
       }
 
-      const uriStr = vscode.Uri.file(filePath).toString();
+      const uriStr = fileUriStr;
 
       for (const loc of locations) {
         const lineNum = loc.line;
