@@ -428,6 +428,13 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
+    // ── 点击位置在 #if 0 等非激活预处理块中，跳过分析 ──
+    if (this._computeInactiveLines(doc)[queryPos.line]) {
+      this._view.webview.postMessage({ type: 'loading', symbolName: '', instanceId });
+      this._sendEmpty('光标在非激活预处理代码中，不做引用分析', instanceId);
+      return;
+    }
+
     // ── 搜索令牌：新搜索作废之前所有未完成的搜索 ──
     const mySearchId = ++this._searchGen;
     // 中断正在跑的旧 rg execFile
