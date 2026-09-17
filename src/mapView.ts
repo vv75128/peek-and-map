@@ -76,6 +76,8 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
   private _searchGen = 0;
   /** 当前活跃的 rg 子进程（execFile 不支持直接 kill，这里保留 AbortController 以便中断） */
   private _activeRgAbort: AbortController | null = null;
+  /** 上一次搜索的 key（word|文件|行号），用于同一变量重复点击去重 */
+  private _lastSearchKey: string | null = null;
 
   constructor(
     private readonly _extensionUri: vscode.Uri,
@@ -227,7 +229,8 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
           await this._doSearch(
             this._normalizeInstanceId(msg.instanceId),
             msg.includeGlob,
-            msg.excludeGlob
+            msg.excludeGlob,
+            true // 手动搜索，强制重新索引
           );
           break;
 
@@ -381,7 +384,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
 
   // ── Search (button-triggered) ──────────────────────────────────────────────
 
-  private async _doSearch(instanceId: string, includeGlobRaw?: unknown, excludeGlobRaw?: unknown): Promise<void> {
+  private async _doSearch(instanceId: string, includeGlobRaw?: unknown, excludeGlobRaw?: unknown, force = false): Promise<void> {
     if (!this._view) { return; }
     const session = this._getOrCreateSession(instanceId);
     session.includeGlob = this._normalizeGlobPattern(includeGlobRaw);
@@ -402,6 +405,14 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     }
     const word = doc.getText(wordRange);
     const queryPos = wordRange.start;
+
+    // ── 同一变量重复点击跳过（词 + 文件 + 行号 相同则认为是同一个符号）──
+    // 手动搜索(force=true)不受此限制
+    const searchKey = `${word}|${doc.uri.fsPath}|${queryPos.line}`;
+    if (!force && searchKey === this._lastSearchKey) {
+      return;
+    }
+    this._lastSearchKey = searchKey;
 
     // ── 无聊词拦截：关键字/基本类型/预处理指令直接返回，避免 rg 搜爆 ──
     if (MapViewProvider.BORING_WORDS.has(word)) {
