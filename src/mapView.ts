@@ -19,18 +19,22 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
 
   /** 高频关键字/基本类型/预处理指令 —— 点击时不做引用搜索，直接返回空 */
   private static readonly BORING_WORDS = new Set<string>([
+    // C 关键字
     'auto', 'break', 'case', 'const', 'continue', 'default', 'do', 'else',
     'enum', 'extern', 'for', 'goto', 'if', 'inline', 'register', 'return',
     'signed', 'sizeof', 'static', 'struct', 'switch', 'typedef', 'union',
     'unsigned', 'volatile', 'while', 'restrict', '_Noreturn', '_Static_assert',
     '_Alignas', '_Alignof', '_Atomic', '_Bool', '_Complex', '_Generic',
     '_Imaginary',
+    // C++ 关键字（常见）
     'class', 'public', 'private', 'protected', 'namespace', 'using',
     'template', 'typename', 'virtual', 'override', 'final', 'new', 'delete',
     'this', 'friend', 'explicit', 'mutable', 'operator', 'throw', 'try',
     'catch', 'constexpr', 'noexcept', 'decltype', 'nullptr',
+    // 基本类型
     'int', 'char', 'short', 'long', 'float', 'double', 'void', 'bool',
     'true', 'false', 'NULL', 'null',
+    // stdint 固定宽度类型
     'uint8_t', 'uint16_t', 'uint32_t', 'uint64_t',
     'int8_t', 'int16_t', 'int32_t', 'int64_t',
     'uint_least8_t', 'uint_least16_t', 'uint_least32_t', 'uint_least64_t',
@@ -39,16 +43,20 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     'int_fast8_t', 'int_fast16_t', 'int_fast32_t', 'int_fast64_t',
     'uintptr_t', 'intptr_t', 'size_t', 'ssize_t', 'ptrdiff_t',
     'wchar_t', 'char16_t', 'char32_t',
+    // 裸前缀（无 _t 后缀的常见写法）
     'uint8', 'uint16', 'uint32', 'uint64',
     'int8', 'int16', 'int32', 'int64',
+    // 预处理指令里的词（点击 #define 时 getWordRangeAtPosition 会取到 define）
     'define', 'ifdef', 'ifndef', 'endif', 'elif',
     'include', 'pragma', 'undef', 'error', 'warning', 'line',
+    // 其他高频宏
     'assert', 'offsetof',
   ]);
 
   private _view?: vscode.WebviewView;
   private _lastKnownEditor?: vscode.TextEditor;
 
+  // Per-instance node maps for lazy tree expansion
   private _instanceSessions = new Map<string, {
     refNodeMap: Map<string, { uri: vscode.Uri; position: vscode.Position; pathSymbolKeys: string[] }>;
     nodeCounter: number;
@@ -224,7 +232,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
             this._normalizeInstanceId(msg.instanceId),
             msg.includeGlob,
             msg.excludeGlob,
-            true
+            true // 手动搜索，强制重新索引
           );
           break;
 
@@ -259,6 +267,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
         case 'jumpTo': {
           const uri = vscode.Uri.parse(msg.uri as string);
           const pos = new vscode.Position(msg.line as number, msg.character as number);
+          // Update peek view immediately (don't wait for cursor-change event)
           this._peekView?.peekLocation(uri, pos);
           try {
             const doc = await vscode.workspace.openTextDocument(uri);
@@ -270,6 +279,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
         }
 
         case 'peekOnly': {
+          // Single-click: update peek view only, do NOT open/change the editor
           const uri = vscode.Uri.parse(msg.uri as string);
           const pos = new vscode.Position(msg.line as number, msg.character as number);
           await this._peekView?.peekLocation(uri, pos);
@@ -328,10 +338,12 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       }
     });
 
+    // ── 文件保存时清空文本搜索缓存 ──
     vscode.workspace.onDidSaveTextDocument(() => {
       this._textSearchCache.clear();
     });
 
+    // ── 鼠标点击变量/函数时自动更新 Map ──────────────────────────────
     vscode.window.onDidChangeTextEditorSelection(async (e) => {
       if (!this._view || !this._view.visible) { return; }
       if (this._isLocked) { return; }
@@ -387,26 +399,32 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
    */
   private async _abortAllInFlight(): Promise<void> {
     const wasSearching = this._searchInFlight > 0;
- 
 
+    // 1. 中断 rg 子进程
     if (this._activeRgAbort) {
       try { this._activeRgAbort.abort(); } catch (_) { /* ignore */ }
       this._activeRgAbort = null;
     }
 
+    // 2. 作废搜索令牌
     this._searchGen++;
+
+    // 3. 取消正在跑的索引
     this._dbManager.cancelIndex();
+
+    // 4. 清 LSP 结果缓存
     this._memberDefCache.clear();
     this._textSearchCache.clear();
+
+    // 5. 清重复点击去重
     this._lastSearchKey = null;
 
+    // 6. 只要上一次搜索还在跑（rg 或索引后处理），就触发 C/C++ 重扫
     if (wasSearching) {
- 
       try {
         await vscode.commands.executeCommand('C_Cpp.RescanWorkspace');
-
-      } catch (e) {
-
+      } catch {
+        // 未安装 C/C++ 扩展或命令不可用时静默忽略
       }
     }
   }
@@ -433,24 +451,31 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     const word = doc.getText(wordRange);
     const queryPos = wordRange.start;
 
+    // ── 同一变量重复点击跳过（词 + 文件 + 行号 相同则认为是同一个符号）──
+    // 手动搜索(force=true)不受此限制
     const searchKey = `${word}|${doc.uri.fsPath}|${queryPos.line}`;
     if (!force && searchKey === this._lastSearchKey) {
       return;
     }
     this._lastSearchKey = searchKey;
 
+    // ── 无聊词拦截：关键字/基本类型/预处理指令直接返回，避免 rg 搜爆 ──
     if (MapViewProvider.BORING_WORDS.has(word)) {
       this._view.webview.postMessage({ type: 'loading', symbolName: word, instanceId });
       this._sendEmpty(`"${word}" 是关键字/基本类型，不做引用分析`, instanceId);
       return;
     }
 
+    // ── 数字常量拦截：纯数字 / 十六进制 / 带后缀的数字直接跳过 ──
+    // 匹配：十进制(123)、十六进制(0xff)、八进制(0o77)、二进制(0b101)、
+    //       浮点数(3.14、.5、1e10)、以及 u/U/l/L/f/F/ll/ULL 等后缀
     if (/^(0x[0-9a-fA-F]+|0o[0-7]+|0b[01]+|\d*\.\d+(?:[eE][+-]?\d+)?|\d+[eE][+-]?\d+|\d+)[uUlLfF]*$/.test(word)) {
       this._view.webview.postMessage({ type: 'loading', symbolName: word, instanceId });
       this._sendEmpty(`"${word}" 是数字常量，不做引用分析`, instanceId);
       return;
     }
 
+    // ── 点击位置在注释里，跳过分析 ──
     const commentCols = this._computeCommentLines(doc);
     const lineCommentCol = commentCols[queryPos.line];
     if (lineCommentCol >= 0 && queryPos.character >= lineCommentCol) {
@@ -459,25 +484,33 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
+    // ── 点击位置在 #if 0 等非激活预处理块中，跳过分析 ──
     if (this._computeInactiveLines(doc)[queryPos.line]) {
       this._view.webview.postMessage({ type: 'loading', symbolName: '', instanceId });
       this._sendEmpty('光标在非激活预处理代码中，不做引用分析', instanceId);
       return;
     }
 
+    // ★ 走到这里说明确实要做一次引用分析 —— 中断所有正在跑的旧操作。
+    //   _abortAllInFlight 里已做 _searchGen++，因此本次搜索令牌取当前值。
     await this._abortAllInFlight();
     const mySearchId = this._searchGen;
 
+    // Clear maps for new search
     session.refNodeMap.clear();
     session.nodeCounter = 0;
 
+    // Show loading state
     this._view.webview.postMessage({ type: 'loading', symbolName: word, instanceId });
 
     const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
 
+    // ── References hierarchy (first level) ─────────────────────────────────
     const refNodes = await this._resolveReferencingSymbols(session, doc.uri, queryPos, wsRoot, word, new Set<string>(), mySearchId);
+    // 竞态检查：已被新搜索取代则丢弃结果
     if (mySearchId !== this._searchGen) { return; }
 
+    // Resolve current symbol + optional owning class for root label/kind
     let rootKind = '';
     let rootLabel = word;
     let rootIsDeclaration = false;
@@ -546,6 +579,12 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
   }
 
   // ── Resolve referencing symbols (for tree expansion) ───────────────────────
+  //
+  // Given a symbol at (uri, pos), find all references to it, then for each
+  // reference determine its enclosing symbol (the function/class that contains
+  // the reference).  Return a deduplicated list of those enclosing symbols as
+  // tree nodes.  Each node stores the enclosing symbol's name position so it
+  // can be expanded recursively to find "who references this enclosing symbol".
 
   private async _resolveReferencingSymbols(
     session: {
@@ -561,6 +600,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     ancestorPathSymbolKeys: Set<string> = new Set<string>(),
     searchToken: number = -1
   ): Promise<TreeNodeData[]> {
+    // 竞态检查辅助：若 searchToken 有效且已过期，返回空
     const isStale = () => searchToken >= 0 && searchToken !== this._searchGen;
 
     let locs: vscode.Location[] | undefined;
@@ -598,20 +638,27 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       )
       : undefined;
     const targetSimpleName = targetSymbol ? this._simpleSymbolName(targetSymbol.name) : '';
+    // 只有 targetSymbol 的名字和 word 一致，且是函数时，才算函数
     const targetIsFunction = !!targetSymbol
       && this._isFunctionLikeSymbol(targetSymbol.kind)
       && this._symbolNameMatchesWord(targetSymbol.name, word);
+    // 只有 targetSymbol 确实是查询的符号时，才把它加入 pathSymbolKeys
     const targetMatchesWord = targetSimpleName === word;
     const pathSymbolKeys = new Set<string>(ancestorPathSymbolKeys);
 
     const result: TreeNodeData[] = [];
+    // Tracks which enclosing symbols have already received an expandable nodeId
     const firstSeenKeys = new Set<string>();
 
+    // 用 LSP 结果判断 word 是局部变量还是静态全局变量：
+    // - 所有 LSP 引用都在同一函数内 → 局部变量
+    // - 所有 LSP 引用都在同一文件内，但跨函数 → 静态全局变量
     let targetFunction: { uri: string; startLine: number; endLine: number } | null = null;
     let targetFileOnly: string | null = null;
     let targetScope: { uri: string; startLine: number; endLine: number } | null = null;
     let targetDefinition: { uri: string; line: number } | null = null;
 
+    // 只对变量启用 targetDefinition 过滤，函数场景跳过
     if (!targetIsFunction) {
       try {
         const defs = await vscode.commands.executeCommand<vscode.Location[]>(
@@ -627,6 +674,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       if (isStale()) { return []; }
     }
 
+    // 先对光标位置调定义跳转，看它是否跳到某个作用域类符号内
     try {
       const cursorDefs = await vscode.commands.executeCommand<vscode.Location[]>(
         'vscode.executeDefinitionProvider', uri, pos
@@ -703,6 +751,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       const enclosing = this._deepestContaining(symbols, loc.range.start);
 
       if (!enclosing) {
+        // Reference at file/global scope — always show as leaf node (not expandable)
         result.push({
           nodeId: `leaf_${++session.nodeCounter}`,
           label: path.basename(loc.uri.fsPath) + ' (global)',
@@ -718,7 +767,9 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
         continue;
       }
 
+      // Skip self-reference: enclosing symbol IS the queried symbol itself
       const symStart = enclosing.selectionRange.start;
+      // 自引用跳过：只有 targetSymbol 名字匹配、且是函数时才跳过
       if (
         targetIsFunction &&
         targetMatchesWord &&
@@ -742,6 +793,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
         )
         : this._inferCppOwnerClass(enclosing.name, refDoc.lineAt(symStart.line).text, refDoc.languageId);
 
+      // Declaration symbol should not be considered as "referenced by its own definition".
       if (
         !targetIsFunction &&
         targetIsDeclaration &&
@@ -753,6 +805,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
         continue;
       }
 
+      // First occurrence of this enclosing symbol → expandable; subsequent → leaf
       const symKey = loc.uri.toString() + '#sym:' + symStart.line + ':' + symStart.character;
       if (pathSymbolKeys.has(symKey)) {
         continue;
@@ -780,6 +833,9 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       });
     }
 
+    // ── 判断 LSP 结果是否完整，决定是否补充文本搜索 ──
+    // LSP 引用全部在同一个函数内 → 局部变量/形参，结果已精确，无需索引补充；
+    // 全工程同名异义的其他出现会被倒排索引扫出来，既慢又引入噪音。
     const lspAllInSameFunction = locs.length > 0 && targetSymbol &&
       this._simpleSymbolName(targetSymbol.name) !== word &&
       locs.every(loc =>
@@ -799,6 +855,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       result.push(...textResults);
     }
 
+    // 按文件路径 + 行号排序
     result.sort((a, b) => {
       if (a.uri !== b.uri) { return a.uri.localeCompare(b.uri); }
       const lineA = a.callLine != null ? a.callLine : a.line;
@@ -832,8 +889,11 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     const isStale = () => searchToken >= 0 && searchToken !== this._searchGen;
     if (isStale()) { return []; }
 
+    // 标记"后处理循环正在进行中"，供 _abortAllInFlight 判断是否需要
+    // 触发 C_Cpp.RescanWorkspace。
     this._searchInFlight++;
     try {
+      // ── 优先查倒排索引（不读缓存，索引查询本身够快） ──
       const db = this._dbManager.getDb();
       const indexedLocations = db.findWordLocations(word);
       if (indexedLocations.length > 0) {
@@ -842,6 +902,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
         );
       }
 
+      // ── 倒排索引没有，回退 rg，这里才用缓存 ──
       const cacheKey = `${word}@${wsRoot}`;
       if (this._textSearchCache.has(cacheKey)) {
         return this._textSearchCache.get(cacheKey)!;
@@ -868,9 +929,9 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
           wsRoot,
         ];
 
+        // 使用 AbortController 以便新搜索到达时中断 rg 进程
         const ac = new AbortController();
         this._activeRgAbort = ac;
- 
         let stdout = '';
         try {
           const result = await execFileAsync(rgPath, args, {
@@ -878,9 +939,9 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
             signal: ac.signal,
           });
           stdout = result.stdout;
-      
         } catch (e: any) {
           if (e && e.name === 'AbortError') {
+            // 被新搜索中断，直接返回空
             return [];
           }
           return result;
@@ -933,9 +994,13 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
             if (seen.has(key)) { continue; }
             seen.add(key);
 
+            // 排除注释里的匹配
             if (commentStartCols[lineNum] >= 0 && startCol >= commentStartCols[lineNum]) { continue; }
+
+            // 排除 #if 0 块里的匹配
             if (inactiveLines[lineNum]) { continue; }
 
+            // 排除字符串字面量里的匹配（#include 行除外）
             const lineText = doc.lineAt(lineNum).text;
             const isIncludeLine = /^\s*#\s*include\b/.test(lineText);
             if (!isIncludeLine) {
@@ -964,6 +1029,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
               if (!inScope) { continue; }
             }
 
+            // 用定义跳转对比，区分全局变量和结构体成员
             if (targetDefinition) {
               const memberDef = await this._resolveMemberDefinition(filePath, lineNum, startCol);
               if (isStale()) { break; }
@@ -1007,6 +1073,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
         // rg 不可用，静默返回
       }
 
+      // ── rg 结果写缓存，限制大小 ──
       if (this._textSearchCache.size > 100) {
         const firstKey = this._textSearchCache.keys().next().value;
         if (firstKey !== undefined) {
@@ -1043,6 +1110,8 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
   ): Promise<TreeNodeData[]> {
     const isStale = () => searchToken >= 0 && searchToken !== this._searchGen;
 
+    // 标记"后处理循环正在进行中"，供 _abortAllInFlight 判断是否需要
+    // 触发 C_Cpp.RescanWorkspace。
     this._searchInFlight++;
     try {
       const result: TreeNodeData[] = [];
@@ -1051,6 +1120,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       const inactiveCache = new Map<string, boolean[]>();
       const db = this._dbManager.getDb();
 
+      // 按文件分组
       const byFile = new Map<string, WordLocation[]>();
       for (const loc of indexedLocations) {
         let list = byFile.get(loc.file_path);
@@ -1062,9 +1132,11 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
         if (isStale()) { break; }
         const fileUriStr = vscode.Uri.file(filePath).toString();
 
+        // ── 提前按作用域裁剪，跳过无关文件，省掉 openTextDocument ──
         if (targetFileOnly && fileUriStr !== targetFileOnly) { continue; }
         if (targetFunction) {
           if (fileUriStr !== targetFunction.uri) { continue; }
+          // 同一文件下，只保留落在函数行范围内的位置
           const inRange = locations.filter(loc =>
             loc.line >= targetFunction!.startLine && loc.line <= targetFunction!.endLine
           );
@@ -1101,9 +1173,13 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
           if (seen.has(key)) { continue; }
           seen.add(key);
 
+          // 注释过滤
           if (commentStartCols[lineNum] >= 0 && startCol >= commentStartCols[lineNum]) { continue; }
+
+          // #if 0 过滤
           if (inactiveLines[lineNum]) { continue; }
 
+          // 字符串过滤
           const lineText = doc.lineAt(lineNum).text;
           const isIncludeLine = /^\s*#\s*include\b/.test(lineText);
           if (!isIncludeLine) {
@@ -1112,6 +1188,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
             if (quoteCount % 2 === 1) { continue; }
           }
 
+          // 局部变量/静态全局变量过滤
           const enclosing = db.findEnclosingSymbol(filePath, lineNum);
           if (targetFunction) {
             const sameFile = uriStr === targetFunction.uri;
@@ -1130,6 +1207,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
             if (!inScope) { continue; }
           }
 
+          // 用定义跳转对比，区分全局变量和结构体成员
           if (targetDefinition) {
             const memberDef = await this._resolveMemberDefinition(filePath, lineNum, startCol);
             if (isStale()) { break; }
@@ -1176,6 +1254,10 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  /**
+   * 对匹配位置调定义跳转，返回定义位置（用于判断结构体成员归属）。
+   * 结果缓存，避免重复调用。
+   */
   private async _resolveMemberDefinition(
     filePath: string,
     line: number,
@@ -1214,6 +1296,9 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     return result;
   }
 
+  /**
+   * 判断定义位置是否在指定的作用域范围内。
+   */
   private async _isDefinitionInScope(
     filePath: string,
     line: number,
@@ -1253,6 +1338,9 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     return null;
   }
 
+  /**
+   * 读取 C_Cpp.files.exclude 配置，转换成 rg 的排除 glob。
+   */
   private _getCppExcludeGlobs(): string[] {
     const excludeGlobs: string[] = [];
     try {
@@ -1270,6 +1358,10 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     return excludeGlobs;
   }
 
+  /**
+   * 扫描整个文件，返回每一行的注释起始列。
+   * -1 表示该行没有注释；>= 0 表示从该列开始是注释。
+   */
   private _computeCommentLines(doc: vscode.TextDocument): number[] {
     const lines = doc.lineCount;
     const commentStartCols: number[] = new Array(lines).fill(-1);
@@ -1310,6 +1402,10 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     return commentStartCols;
   }
 
+  /**
+   * 扫描整个文件，返回每一行是否在 #if 0 块中。
+   * 只处理 #if 0 和 #endif 的简单配对，不处理嵌套和 #else。
+   */
   private _computeInactiveLines(doc: vscode.TextDocument): boolean[] {
     const lines = doc.lineCount;
     const inactive: boolean[] = new Array(lines).fill(false);
@@ -1335,9 +1431,11 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     return inactive;
   }
 
+  // ── Expand: Reference hierarchy ────────────────────────────────────────────
+
   private async _expandRef(instanceId: string, nodeId: string): Promise<void> {
     if (!this._view) { return; }
-    const mySearchId = this._searchGen;
+    const mySearchId = this._searchGen; // 展开时不抢占令牌，只检查是否被新搜索作废
     const session = this._getOrCreateSession(instanceId);
     const info = session.refNodeMap.get(nodeId);
     if (!info) {
@@ -1371,6 +1469,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  /** Recursively find the innermost symbol whose range contains `pos`. */
   private _deepestContaining(
     symbols: vscode.DocumentSymbol[],
     pos: vscode.Position
@@ -1512,6 +1611,8 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
   private _rangeSize(r: vscode.Range): number {
     return (r.end.line - r.start.line) * 10000 + (r.end.character - r.start.character);
   }
+
+  // ── Generic helpers ────────────────────────────────────────────────────────
 
   private _relativePath(fsPath: string, wsRoot: string): string {
     if (wsRoot && fsPath.startsWith(wsRoot)) {

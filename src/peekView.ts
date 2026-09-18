@@ -1236,6 +1236,7 @@ export class PeekViewProvider implements vscode.WebviewViewProvider {
       line-height: 1.5;
     }
   </style>
+  <!-- Dynamic theme token colors (updated via postMessage on theme change) -->
   <style id="theme-tokens">${initialThemeCss}</style>
 </head>
 <body>
@@ -1269,6 +1270,8 @@ export class PeekViewProvider implements vscode.WebviewViewProvider {
     const vscodeApi = acquireVsCodeApi();
 
     // ── 立即通知扩展 webview 已就绪 ─────────────────────────────────────────
+    // 此代码在 DOM 解析完成后同步运行，是向扩展发送消息的最早时机。
+    // 本地脚本加载极快，但即使外部脚本延迟，ready 也会第一时间发出。
     vscodeApi.postMessage({ type: 'ready' });
 
     // ── DOM 引用 ─────────────────────────────────────────────────────────────
@@ -1287,19 +1290,19 @@ export class PeekViewProvider implements vscode.WebviewViewProvider {
     const hoverPreview = document.getElementById('hover-preview');
 
     let currentCursorLine  = 0;
-    let currentDefUri      = null;
-    let currentSymbolKind  = null;
+    let currentDefUri      = null; // vscode URI string of the definition file
+    let currentSymbolKind  = null; // last displayed symbol kind
     let currentContexts    = [];
     let currentSelectedIndex = 0;
     let definitionListWidth = 260;
     let isDraggingSplitter = false;
-    let pendingRenderArgs  = null;
+    let pendingRenderArgs  = null; // 等待语法高亮组件加载完成后重绘
     let isLocked           = false;
 
     // ── Hover 预览状态 ──────────────────────────────────────────────────────
     let hoverTimer      = null;
-    let hoverLastKey    = null;
-    let hoverPendingKey = null;
+    let hoverLastKey    = null;   // 上次成功显示的 (uri,line,char)
+    let hoverPendingKey = null;   // 正在等待响应的 key
     let hoverMouseX     = 0;
     let hoverMouseY     = 0;
     let hoverVisible    = false;
@@ -1403,6 +1406,7 @@ export class PeekViewProvider implements vscode.WebviewViewProvider {
     ${buildKindIconFunction('kindSymbol')}
 
     function kindColor(kind) {
+      // Read the CSS var injected from the real TextMate theme (see generateSymbolKindCss).
       const v = getComputedStyle(document.documentElement).getPropertyValue('--peek-kind-' + kind).trim();
       return v || null;
     }
@@ -1779,6 +1783,7 @@ export class PeekViewProvider implements vscode.WebviewViewProvider {
     }
 
     // ── Ctrl+click: 在 context 窗口内跳转定义 ────────────────────────────
+    // 跟踪 Ctrl 键状态以显示下划线提示
     document.addEventListener('keydown', (e) => {
       if (e.key === 'Control') { document.body.classList.add('ctrl-held'); }
     });
@@ -1793,9 +1798,11 @@ export class PeekViewProvider implements vscode.WebviewViewProvider {
       if (!e.ctrlKey) { return; }
       const row = e.target.closest('tr[data-line]');
       if (!row) { return; }
+      // 不处理行号列
       if (e.target.closest('.line-num')) { return; }
 
       const line = parseInt(row.dataset.line, 10);
+      // 利用 caretRangeFromPoint 计算点击在源码行中的字符偏移
       let character = 0;
       const range = document.caretRangeFromPoint(e.clientX, e.clientY);
       if (range) {
@@ -1819,13 +1826,16 @@ export class PeekViewProvider implements vscode.WebviewViewProvider {
     codeContainer.addEventListener('dblclick', (e) => {
       const row = e.target.closest('tr[data-line]');
       if (!row) { return; }
+      // 行号列双击 → 跳转
       if (e.target.closest('.line-num')) {
         const line = parseInt(row.dataset.line, 10);
         vscodeApi.postMessage({ type: 'jumpToLine', line, uri: currentDefUri });
         return;
       }
+      // 如果双击选中了实际文字，当作正常选中，不跳转
       const sel = window.getSelection();
       if (sel && sel.toString().trim().length > 0) { return; }
+      // 空白区域双击 → 跳转到编辑器
       const line = parseInt(row.dataset.line, 10);
       vscodeApi.postMessage({ type: 'jumpToLine', line, uri: currentDefUri });
     });
@@ -1834,6 +1844,7 @@ export class PeekViewProvider implements vscode.WebviewViewProvider {
     const MIN_FONT_SIZE = 8;
     const MAX_FONT_SIZE = 40;
     const FONT_SIZE_STEP = 1;
+    // 从 webview state 恢复或使用默认值
     let ctxFontSize = (vscodeApi.getState() && vscodeApi.getState().fontSize) || 0;
     if (ctxFontSize) {
       codeContainer.style.setProperty('--ctx-font-size', ctxFontSize + 'px');
@@ -1843,6 +1854,7 @@ export class PeekViewProvider implements vscode.WebviewViewProvider {
       if (!e.ctrlKey) { return; }
       e.preventDefault();
 
+      // 首次缩放时读取当前计算字体大小作为基准
       if (!ctxFontSize) {
         ctxFontSize = parseFloat(getComputedStyle(codeContainer).fontSize) || 13;
       }
@@ -1855,6 +1867,7 @@ export class PeekViewProvider implements vscode.WebviewViewProvider {
       }
       if (ctxFontSize === oldSize) { return; }
 
+      // 记录当前滚动位置，按字体比例调整，保持第一行不变
       const scrollTop = codeContainer.scrollTop;
       const ratio = ctxFontSize / oldSize;
 
@@ -1870,6 +1883,7 @@ export class PeekViewProvider implements vscode.WebviewViewProvider {
       const containerRect = codeContainer.getBoundingClientRect();
       const rowRect = row.getBoundingClientRect();
       const rowHeight = rowRect.height;
+      // 目标：让这一行位于容器上方约 1/4 处，而不是顶部
       const offset = (containerRect.height - rowHeight) / 4;
       codeContainer.scrollTop += rowRect.top - containerRect.top - offset;
     }
