@@ -22,7 +22,8 @@ export class PeekViewProvider implements vscode.WebviewViewProvider {
   private _lastKnownEditor?: vscode.TextEditor;
 
   // ── Navigation history ring (back / forward) ─────────────────────────────
-  // New entries are always appended by cursor-driven updates and in-view jumps.
+  // New entries are always appended by in-view jumps (ctrl+click / map click).
+  // Editor-driven updates replace the current entry instead of pushing new ones.
   // When capacity is reached, the oldest entry is overwritten (ring semantics).
   private _navHistoryRing: PeekContextBundle[] = [];
   private _navHistoryIndex = -1;
@@ -126,9 +127,28 @@ export class PeekViewProvider implements vscode.WebviewViewProvider {
             );
             const bundle = await this._resolveDefinitionBundle(defs ?? []);
             if (bundle) {
-              this._appendCurrentBundle(bundle);
+              // 视图内跳转：记录到前进/后退历史
+              this._appendCurrentBundle(bundle, true);
             }
           } catch { /* no provider */ }
+          break;
+        }
+
+        // 光标悬停在 peek 窗口内的标识符上 → 查询 hover 并预览签名
+        case 'hoverDefinition': {
+          const hoverLine = msg.line as number;
+          const hoverChar = msg.character as number;
+          const hoverUri  = msg.uri
+            ? vscode.Uri.parse(msg.uri as string)
+            : undefined;
+          if (!hoverUri) { break; }
+          const hoverPos = new vscode.Position(hoverLine, hoverChar);
+          await this._sendHoverPreview(hoverUri, hoverPos);
+          break;
+        }
+
+        case 'hoverClear': {
+          // webview 侧自行清理浮层，扩展侧无需处理
           break;
         }
 
@@ -209,7 +229,8 @@ export class PeekViewProvider implements vscode.WebviewViewProvider {
     if (defLocations.length > 0) {
       const bundle = await this._resolveDefinitionBundle(defLocations);
       if (bundle) {
-        this._appendCurrentBundle(bundle);
+        // 编辑器驱动：替换当前项，不新增历史，不影响前进/后退栈
+        this._appendCurrentBundle(bundle, false);
         return;
       }
     }
@@ -226,8 +247,90 @@ export class PeekViewProvider implements vscode.WebviewViewProvider {
     if (!this._view) { return; }
     const ctx = await this._getContextFromLocation(uri, pos, true);
     if (ctx) {
-      this._appendCurrentContext(ctx);
+      // 视图内跳转：记录到前进/后退历史
+      this._appendCurrentContext(ctx, true);
     }
+  }
+
+  /**
+   * 用 executeHoverProvider 查询 (uri, pos) 处的 hover 内容，
+   * 只取签名行，回发 hoverPreview 消息给 webview 显示浮层。
+   *
+   * 不读定义代码片段，也不显示注释。
+   */
+  private async _sendHoverPreview(uri: vscode.Uri, pos: vscode.Position): Promise<void> {
+    if (!this._view) { return; }
+
+    let hovers: vscode.Hover[] = [];
+    try {
+      const result = await vscode.commands.executeCommand<vscode.Hover[]>(
+        'vscode.executeHoverProvider',
+        uri,
+        pos
+      );
+      if (result && result.length > 0) { hovers = result; }
+    } catch { /* no provider */ }
+
+    if (hovers.length === 0) {
+      this._view.webview.postMessage({ type: 'hoverPreview', empty: true });
+      return;
+    }
+
+    // 取第一个能提取出签名行的 hover 内容。
+    let signature = '';
+    for (const h of hovers) {
+      for (const c of h.contents) {
+        const raw = typeof c === 'string' ? c : c.value;
+        const sig = this._extractSignature(raw);
+        if (sig) { signature = sig; break; }
+      }
+      if (signature) { break; }
+    }
+
+    if (!signature) {
+      this._view.webview.postMessage({ type: 'hoverPreview', empty: true });
+      return;
+    }
+
+    this._view.webview.postMessage({
+      type: 'hoverPreview',
+      empty: false,
+      signature,
+    });
+  }
+
+  /**
+   * 从 hover 返回的 Markdown 里提取签名行。
+   *
+   * LSP hover 的典型格式：
+   *   ```cpp
+   *   void foo(int x)
+   *   ```
+   *   注释文本...
+   *
+   * 优先取第一个围栏代码块的内容；没有围栏则取第一段非空文本的第一行。
+   */
+  private _extractSignature(md: string): string {
+    if (!md) { return ''; }
+
+    // 1) 优先：第一个围栏代码块 ```lang ... ```
+    const fence = md.match(/```[\w+-]*\n([\s\S]*?)```/);
+    if (fence && fence[1].trim()) {
+      return fence[1].trim();
+    }
+
+    // 2) 回退：第一段非空文本的第一行
+    const lines = md.split('\n');
+    for (const line of lines) {
+      const t = line.trim();
+      if (!t) { continue; }
+      // 跳过 Markdown 分隔线
+      if (/^---+$/.test(t)) { continue; }
+      // 跳过常见的裸代码块围栏行
+      if (/^```/.test(t)) { continue; }
+      return t;
+    }
+    return '';
   }
 
   /**
@@ -685,17 +788,35 @@ export class PeekViewProvider implements vscode.WebviewViewProvider {
     return -1;
   }
 
-  private _appendCurrentContext(next: ContextInfo): void {
-    this._appendCurrentBundle({ contexts: [next], selectedIndex: 0 });
+  private _appendCurrentContext(next: ContextInfo, recordHistory: boolean = true): void {
+    this._appendCurrentBundle({ contexts: [next], selectedIndex: 0 }, recordHistory);
   }
 
-  private _appendCurrentBundle(next: PeekContextBundle): void {
+  /**
+   * 更新 peek 内容。
+   * - recordHistory = true：视图内跳转（ctrl+click / map 单击），入历史栈。
+   * - recordHistory = false：编辑器光标驱动，替换当前项，不新增历史，
+   *   也不影响前进/后退栈。
+   */
+  private _appendCurrentBundle(next: PeekContextBundle, recordHistory: boolean = true): void {
     if (!this._view) { return; }
 
     const normalized = this._normalizeBundle(next);
 
-    // If we are currently in the middle of history (after going back),
-    // appending a new entry starts a new branch and drops forward entries.
+    if (!recordHistory) {
+      // 编辑器驱动：替换当前项，不新增历史
+      if (this._navHistoryIndex >= 0 && this._navHistoryIndex < this._navHistoryRing.length) {
+        this._navHistoryRing[this._navHistoryIndex] = normalized;
+      } else {
+        this._navHistoryRing.push(normalized);
+        this._navHistoryIndex = this._navHistoryRing.length - 1;
+      }
+      this._view.webview.postMessage({ type: 'update', data: normalized });
+      this._sendNavState();
+      return;
+    }
+
+    // 视图内跳转：截断前进分支后入栈
     if (this._navHistoryIndex < this._navHistoryRing.length - 1) {
       this._navHistoryRing.splice(this._navHistoryIndex + 1);
     }
@@ -1091,8 +1212,30 @@ export class PeekViewProvider implements vscode.WebviewViewProvider {
       text-decoration: underline;
       cursor: pointer;
     }
+
+    /* ── Hover signature preview ──────────────────────────────────── */
+    #hover-preview {
+      position: fixed;
+      z-index: 1000;
+      display: none;
+      max-width: 640px;
+      min-width: 200px;
+      max-height: 240px;
+      overflow: auto;
+      background: var(--vscode-editorHoverWidget-background, #252526);
+      border: 1px solid var(--vscode-editorHoverWidget-border, #454545);
+      border-radius: 4px;
+      box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+      padding: 6px 10px;
+      font-family: var(--vscode-editor-font-family, 'Consolas', monospace);
+      font-size: var(--vscode-editor-font-size, 13px);
+      color: var(--vscode-editor-foreground, #d4d4d4);
+      pointer-events: none;
+      white-space: pre-wrap;
+      word-break: break-word;
+      line-height: 1.5;
+    }
   </style>
-  <!-- Dynamic theme token colors (updated via postMessage on theme change) -->
   <style id="theme-tokens">${initialThemeCss}</style>
 </head>
 <body>
@@ -1111,6 +1254,8 @@ export class PeekViewProvider implements vscode.WebviewViewProvider {
     <div id="code-container"></div>
   </div>
 
+  <div id="hover-preview" role="tooltip" aria-hidden="true"></div>
+
   <!-- Prism 全部来自本地 media/ 目录，无需网络 -->
   <script nonce="${nonce}" src="${prismJs}"></script>
   <script nonce="${nonce}" src="${autoloader}"></script>
@@ -1124,8 +1269,6 @@ export class PeekViewProvider implements vscode.WebviewViewProvider {
     const vscodeApi = acquireVsCodeApi();
 
     // ── 立即通知扩展 webview 已就绪 ─────────────────────────────────────────
-    // 此代码在 DOM 解析完成后同步运行，是向扩展发送消息的最早时机。
-    // 本地脚本加载极快，但即使外部脚本延迟，ready 也会第一时间发出。
     vscodeApi.postMessage({ type: 'ready' });
 
     // ── DOM 引用 ─────────────────────────────────────────────────────────────
@@ -1141,15 +1284,26 @@ export class PeekViewProvider implements vscode.WebviewViewProvider {
     const navForwardBtn = document.getElementById('nav-forward-btn');
     const lockBtn       = document.getElementById('lock-btn');
 
+    const hoverPreview = document.getElementById('hover-preview');
+
     let currentCursorLine  = 0;
-    let currentDefUri      = null; // vscode URI string of the definition file
-    let currentSymbolKind  = null; // last displayed symbol kind
+    let currentDefUri      = null;
+    let currentSymbolKind  = null;
     let currentContexts    = [];
     let currentSelectedIndex = 0;
     let definitionListWidth = 260;
     let isDraggingSplitter = false;
-    let pendingRenderArgs  = null; // 等待语法高亮组件加载完成后重绘
+    let pendingRenderArgs  = null;
     let isLocked           = false;
+
+    // ── Hover 预览状态 ──────────────────────────────────────────────────────
+    let hoverTimer      = null;
+    let hoverLastKey    = null;
+    let hoverPendingKey = null;
+    let hoverMouseX     = 0;
+    let hoverMouseY     = 0;
+    let hoverVisible    = false;
+    const HOVER_DELAY_MS = 300;
 
     const SPLITTER_MIN_WIDTH = 220;
     const SPLITTER_MAX_WIDTH = 360;
@@ -1249,7 +1403,6 @@ export class PeekViewProvider implements vscode.WebviewViewProvider {
     ${buildKindIconFunction('kindSymbol')}
 
     function kindColor(kind) {
-      // Read the CSS var injected from the real TextMate theme (see generateSymbolKindCss).
       const v = getComputedStyle(document.documentElement).getPropertyValue('--peek-kind-' + kind).trim();
       return v || null;
     }
@@ -1387,6 +1540,7 @@ export class PeekViewProvider implements vscode.WebviewViewProvider {
         document.getElementById('file-name').textContent = '';
         currentContexts = [];
         currentSelectedIndex = 0;
+        hideHoverPreview();
         return;
       }
 
@@ -1407,6 +1561,11 @@ export class PeekViewProvider implements vscode.WebviewViewProvider {
         return;
       }
 
+      if (msg.type === 'hoverPreview') {
+        handleHoverPreview(msg);
+        return;
+      }
+
       if (msg.type === 'update') {
         const bundle = normalizeBundle(msg.data);
         currentContexts = bundle.contexts;
@@ -1415,8 +1574,134 @@ export class PeekViewProvider implements vscode.WebviewViewProvider {
         mainPane.style.display = 'flex';
         renderDefinitionList();
         renderCurrentContext();
+        // 内容变化时隐藏浮层，避免定位到旧内容
+        hideHoverPreview();
       }
     });
+
+    // ── Hover 预览渲染（只显示签名行）──────────────────────────────────────
+    function handleHoverPreview(msg) {
+      if (msg.empty) {
+        hoverPendingKey = null;
+        hideHoverPreview();
+        return;
+      }
+
+      hoverLastKey = hoverPendingKey;
+      hoverPendingKey = null;
+
+      hoverPreview.textContent = msg.signature || '';
+      hoverPreview.style.display = 'block';
+      hoverPreview.setAttribute('aria-hidden', 'false');
+      hoverVisible = true;
+
+      positionHoverPreview(hoverMouseX, hoverMouseY);
+    }
+
+    function hideHoverPreview() {
+      if (!hoverVisible) { return; }
+      hoverVisible = false;
+      hoverLastKey = null;
+      hoverPreview.style.display = 'none';
+      hoverPreview.setAttribute('aria-hidden', 'true');
+    }
+
+    function positionHoverPreview(x, y) {
+      const rect = hoverPreview.getBoundingClientRect();
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      let left = x + 12;
+      let top  = y + 12;
+      if (left + rect.width > vw - 8) { left = Math.max(8, vw - rect.width - 8); }
+      if (top + rect.height > vh - 8) { top = Math.max(8, y - rect.height - 12); }
+      hoverPreview.style.left = left + 'px';
+      hoverPreview.style.top  = top + 'px';
+    }
+
+    // ── Hover 命中检测 ──────────────────────────────────────────────────────
+    function hitTestIdentifier(clientX, clientY) {
+      const el = document.elementFromPoint(clientX, clientY);
+      if (!el) { return null; }
+      if (el.closest('.line-num')) { return null; }
+      const row = el.closest('tr[data-line]');
+      if (!row) { return null; }
+
+      const line = parseInt(row.dataset.line, 10);
+      let character = 0;
+      const range = document.caretRangeFromPoint(clientX, clientY);
+      if (range) {
+        const codeCell = row.querySelector('.line-code');
+        if (!codeCell) { return null; }
+        const walker = document.createTreeWalker(codeCell, NodeFilter.SHOW_TEXT, null);
+        let node;
+        while ((node = walker.nextNode())) {
+          if (node === range.startContainer) {
+            character += range.startOffset;
+            break;
+          }
+          character += node.textContent.length;
+        }
+      }
+      return { line, character, uri: currentDefUri };
+    }
+
+    function isIdentifierPosition(clientX, clientY) {
+      const range = document.caretRangeFromPoint(clientX, clientY);
+      if (!range || !range.startContainer || range.startContainer.nodeType !== Node.TEXT_NODE) {
+        return false;
+      }
+      const text = range.startContainer.textContent || '';
+      const off  = range.startOffset;
+      const chAt   = off < text.length ? text.charCodeAt(off) : 0;
+      const chLeft = off > 0 ? text.charCodeAt(off - 1) : 0;
+      const isIdent = (c) => (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || c === 95 || (c >= 97 && c <= 122) || c === 36;
+      return isIdent(chAt) || isIdent(chLeft);
+    }
+
+    codeContainer.addEventListener('mousemove', (e) => {
+      hoverMouseX = e.clientX;
+      hoverMouseY = e.clientY;
+
+      const hit = hitTestIdentifier(e.clientX, e.clientY);
+      if (!hit || !hit.uri || !isIdentifierPosition(e.clientX, e.clientY)) {
+        if (hoverTimer) { clearTimeout(hoverTimer); hoverTimer = null; }
+        hideHoverPreview();
+        return;
+      }
+
+      const key = hit.uri + '|' + hit.line + ':' + hit.character;
+      if (key === hoverLastKey && hoverVisible) {
+        positionHoverPreview(hoverMouseX, hoverMouseY);
+        return;
+      }
+      if (key === hoverPendingKey) { return; }
+
+      if (hoverTimer) { clearTimeout(hoverTimer); }
+      hoverTimer = setTimeout(() => {
+        hoverTimer = null;
+        hoverPendingKey = key;
+        vscodeApi.postMessage({
+          type: 'hoverDefinition',
+          line: hit.line,
+          character: hit.character,
+          uri: hit.uri,
+        });
+      }, HOVER_DELAY_MS);
+    });
+
+    codeContainer.addEventListener('mouseleave', () => {
+      if (hoverTimer) { clearTimeout(hoverTimer); hoverTimer = null; }
+      hideHoverPreview();
+    });
+
+    codeContainer.addEventListener('mousedown', () => {
+      if (hoverTimer) { clearTimeout(hoverTimer); hoverTimer = null; }
+      hideHoverPreview();
+    });
+
+    codeContainer.addEventListener('scroll', () => {
+      hideHoverPreview();
+    }, { passive: true });
 
     // ── 渲染 ─────────────────────────────────────────────────────────────────
     function escapeHtml(str) {
@@ -1495,7 +1780,6 @@ export class PeekViewProvider implements vscode.WebviewViewProvider {
     }
 
     // ── Ctrl+click: 在 context 窗口内跳转定义 ────────────────────────────
-    // 跟踪 Ctrl 键状态以显示下划线提示
     document.addEventListener('keydown', (e) => {
       if (e.key === 'Control') { document.body.classList.add('ctrl-held'); }
     });
@@ -1590,15 +1874,15 @@ export class PeekViewProvider implements vscode.WebviewViewProvider {
     }, { passive: false });
 
     function scrollCursorIntoView() {
-	  const row = codeContainer.querySelector('tr.cursor-line');
-	  if (!row) { return; }
-	  const containerRect = codeContainer.getBoundingClientRect();
-	  const rowRect = row.getBoundingClientRect();
-	  const rowHeight = rowRect.height;
-	  // 目标：让这一行位于容器上方约 1/4 处，而不是顶部
-	  const offset = (containerRect.height - rowHeight) / 4;
-	  codeContainer.scrollTop += rowRect.top - containerRect.top - offset;
-	}
+      const row = codeContainer.querySelector('tr.cursor-line');
+      if (!row) { return; }
+      const containerRect = codeContainer.getBoundingClientRect();
+      const rowRect = row.getBoundingClientRect();
+      const rowHeight = rowRect.height;
+      // 目标：让这一行位于容器上方约 1/4 处，而不是顶部
+      const offset = (containerRect.height - rowHeight) / 4;
+      codeContainer.scrollTop += rowRect.top - containerRect.top - offset;
+    }
   </script>
 </body>
 </html>`;
