@@ -19,22 +19,18 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
 
   /** 高频关键字/基本类型/预处理指令 —— 点击时不做引用搜索，直接返回空 */
   private static readonly BORING_WORDS = new Set<string>([
-    // C 关键字
     'auto', 'break', 'case', 'const', 'continue', 'default', 'do', 'else',
     'enum', 'extern', 'for', 'goto', 'if', 'inline', 'register', 'return',
     'signed', 'sizeof', 'static', 'struct', 'switch', 'typedef', 'union',
     'unsigned', 'volatile', 'while', 'restrict', '_Noreturn', '_Static_assert',
     '_Alignas', '_Alignof', '_Atomic', '_Bool', '_Complex', '_Generic',
     '_Imaginary',
-    // C++ 关键字（常见）
     'class', 'public', 'private', 'protected', 'namespace', 'using',
     'template', 'typename', 'virtual', 'override', 'final', 'new', 'delete',
     'this', 'friend', 'explicit', 'mutable', 'operator', 'throw', 'try',
     'catch', 'constexpr', 'noexcept', 'decltype', 'nullptr',
-    // 基本类型
     'int', 'char', 'short', 'long', 'float', 'double', 'void', 'bool',
     'true', 'false', 'NULL', 'null',
-    // stdint 固定宽度类型
     'uint8_t', 'uint16_t', 'uint32_t', 'uint64_t',
     'int8_t', 'int16_t', 'int32_t', 'int64_t',
     'uint_least8_t', 'uint_least16_t', 'uint_least32_t', 'uint_least64_t',
@@ -43,20 +39,16 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     'int_fast8_t', 'int_fast16_t', 'int_fast32_t', 'int_fast64_t',
     'uintptr_t', 'intptr_t', 'size_t', 'ssize_t', 'ptrdiff_t',
     'wchar_t', 'char16_t', 'char32_t',
-    // 裸前缀（无 _t 后缀的常见写法）
     'uint8', 'uint16', 'uint32', 'uint64',
     'int8', 'int16', 'int32', 'int64',
-    // 预处理指令里的词（点击 #define 时 getWordRangeAtPosition 会取到 define）
     'define', 'ifdef', 'ifndef', 'endif', 'elif',
     'include', 'pragma', 'undef', 'error', 'warning', 'line',
-    // 其他高频宏
     'assert', 'offsetof',
   ]);
 
   private _view?: vscode.WebviewView;
   private _lastKnownEditor?: vscode.TextEditor;
 
-  // Per-instance node maps for lazy tree expansion
   private _instanceSessions = new Map<string, {
     refNodeMap: Map<string, { uri: vscode.Uri; position: vscode.Position; pathSymbolKeys: string[] }>;
     nodeCounter: number;
@@ -78,6 +70,8 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
   private _activeRgAbort: AbortController | null = null;
   /** 上一次搜索的 key（word|文件|行号），用于同一变量重复点击去重 */
   private _lastSearchKey: string | null = null;
+  /** 正在进行中的搜索后处理数量（rg/索引返回后到结果组装完成的循环）。 */
+  private _searchInFlight = 0;
 
   constructor(
     private readonly _extensionUri: vscode.Uri,
@@ -230,7 +224,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
             this._normalizeInstanceId(msg.instanceId),
             msg.includeGlob,
             msg.excludeGlob,
-            true // 手动搜索，强制重新索引
+            true
           );
           break;
 
@@ -265,7 +259,6 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
         case 'jumpTo': {
           const uri = vscode.Uri.parse(msg.uri as string);
           const pos = new vscode.Position(msg.line as number, msg.character as number);
-          // Update peek view immediately (don't wait for cursor-change event)
           this._peekView?.peekLocation(uri, pos);
           try {
             const doc = await vscode.workspace.openTextDocument(uri);
@@ -277,7 +270,6 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
         }
 
         case 'peekOnly': {
-          // Single-click: update peek view only, do NOT open/change the editor
           const uri = vscode.Uri.parse(msg.uri as string);
           const pos = new vscode.Position(msg.line as number, msg.character as number);
           await this._peekView?.peekLocation(uri, pos);
@@ -336,12 +328,10 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       }
     });
 
-    // ── 文件保存时清空文本搜索缓存 ──
     vscode.workspace.onDidSaveTextDocument(() => {
       this._textSearchCache.clear();
     });
 
-    // ── 鼠标点击变量/函数时自动更新 Map ──────────────────────────────
     vscode.window.onDidChangeTextEditorSelection(async (e) => {
       if (!this._view || !this._view.visible) { return; }
       if (this._isLocked) { return; }
@@ -384,6 +374,43 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
 
   // ── Search (button-triggered) ──────────────────────────────────────────────
 
+  /**
+   * 中断当前所有正在跑的异步操作。
+   *
+   * - rg 子进程、搜索令牌、索引 generation、缓存：始终清理。
+   * - C_Cpp.RescanWorkspace：只要上一次搜索仍在跑（rg 或索引后处理），就触发。
+   *
+   * 为什么用 _searchInFlight 而不是 _activeRgAbort：
+   * - 倒排索引已建好时，点击变量走 _resolveFromIndex，不用 rg，
+   *   _activeRgAbort 始终为 null，无法反映"后处理循环正在发 LSP"。
+   * - _searchInFlight 覆盖 rg 与索引两条路径的后处理循环。
+   */
+  private async _abortAllInFlight(): Promise<void> {
+    const wasSearching = this._searchInFlight > 0;
+ 
+
+    if (this._activeRgAbort) {
+      try { this._activeRgAbort.abort(); } catch (_) { /* ignore */ }
+      this._activeRgAbort = null;
+    }
+
+    this._searchGen++;
+    this._dbManager.cancelIndex();
+    this._memberDefCache.clear();
+    this._textSearchCache.clear();
+    this._lastSearchKey = null;
+
+    if (wasSearching) {
+ 
+      try {
+        await vscode.commands.executeCommand('C_Cpp.RescanWorkspace');
+
+      } catch (e) {
+
+      }
+    }
+  }
+
   private async _doSearch(instanceId: string, includeGlobRaw?: unknown, excludeGlobRaw?: unknown, force = false): Promise<void> {
     if (!this._view) { return; }
     const session = this._getOrCreateSession(instanceId);
@@ -406,31 +433,24 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     const word = doc.getText(wordRange);
     const queryPos = wordRange.start;
 
-    // ── 同一变量重复点击跳过（词 + 文件 + 行号 相同则认为是同一个符号）──
-    // 手动搜索(force=true)不受此限制
     const searchKey = `${word}|${doc.uri.fsPath}|${queryPos.line}`;
     if (!force && searchKey === this._lastSearchKey) {
       return;
     }
     this._lastSearchKey = searchKey;
 
-    // ── 无聊词拦截：关键字/基本类型/预处理指令直接返回，避免 rg 搜爆 ──
     if (MapViewProvider.BORING_WORDS.has(word)) {
       this._view.webview.postMessage({ type: 'loading', symbolName: word, instanceId });
       this._sendEmpty(`"${word}" 是关键字/基本类型，不做引用分析`, instanceId);
       return;
     }
 
-    // ── 数字常量拦截：纯数字 / 十六进制 / 带后缀的数字直接跳过 ──
-    // 匹配：十进制(123)、十六进制(0xff)、八进制(0o77)、二进制(0b101)、
-    //       浮点数(3.14、.5、1e10)、以及 u/U/l/L/f/F/ll/ULL 等后缀
     if (/^(0x[0-9a-fA-F]+|0o[0-7]+|0b[01]+|\d*\.\d+(?:[eE][+-]?\d+)?|\d+[eE][+-]?\d+|\d+)[uUlLfF]*$/.test(word)) {
       this._view.webview.postMessage({ type: 'loading', symbolName: word, instanceId });
       this._sendEmpty(`"${word}" 是数字常量，不做引用分析`, instanceId);
       return;
     }
 
-    // ── 点击位置在注释里，跳过分析 ──
     const commentCols = this._computeCommentLines(doc);
     const lineCommentCol = commentCols[queryPos.line];
     if (lineCommentCol >= 0 && queryPos.character >= lineCommentCol) {
@@ -439,36 +459,25 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
-    // ── 点击位置在 #if 0 等非激活预处理块中，跳过分析 ──
     if (this._computeInactiveLines(doc)[queryPos.line]) {
       this._view.webview.postMessage({ type: 'loading', symbolName: '', instanceId });
       this._sendEmpty('光标在非激活预处理代码中，不做引用分析', instanceId);
       return;
     }
 
-    // ── 搜索令牌：新搜索作废之前所有未完成的搜索 ──
-    const mySearchId = ++this._searchGen;
-    // 中断正在跑的旧 rg execFile
-    if (this._activeRgAbort) {
-      try { this._activeRgAbort.abort(); } catch (_) { /* ignore */ }
-      this._activeRgAbort = null;
-    }
+    await this._abortAllInFlight();
+    const mySearchId = this._searchGen;
 
-    // Clear maps for new search
     session.refNodeMap.clear();
     session.nodeCounter = 0;
 
-    // Show loading state
     this._view.webview.postMessage({ type: 'loading', symbolName: word, instanceId });
 
     const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
 
-    // ── References hierarchy (first level) ─────────────────────────────────
     const refNodes = await this._resolveReferencingSymbols(session, doc.uri, queryPos, wsRoot, word, new Set<string>(), mySearchId);
-    // 竞态检查：已被新搜索取代则丢弃结果
     if (mySearchId !== this._searchGen) { return; }
 
-    // Resolve current symbol + optional owning class for root label/kind
     let rootKind = '';
     let rootLabel = word;
     let rootIsDeclaration = false;
@@ -537,12 +546,6 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
   }
 
   // ── Resolve referencing symbols (for tree expansion) ───────────────────────
-  //
-  // Given a symbol at (uri, pos), find all references to it, then for each
-  // reference determine its enclosing symbol (the function/class that contains
-  // the reference).  Return a deduplicated list of those enclosing symbols as
-  // tree nodes.  Each node stores the enclosing symbol's name position so it
-  // can be expanded recursively to find "who references this enclosing symbol".
 
   private async _resolveReferencingSymbols(
     session: {
@@ -558,7 +561,6 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     ancestorPathSymbolKeys: Set<string> = new Set<string>(),
     searchToken: number = -1
   ): Promise<TreeNodeData[]> {
-    // 竞态检查辅助：若 searchToken 有效且已过期，返回空
     const isStale = () => searchToken >= 0 && searchToken !== this._searchGen;
 
     let locs: vscode.Location[] | undefined;
@@ -596,27 +598,20 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       )
       : undefined;
     const targetSimpleName = targetSymbol ? this._simpleSymbolName(targetSymbol.name) : '';
-    // 只有 targetSymbol 的名字和 word 一致，且是函数时，才算函数
     const targetIsFunction = !!targetSymbol
       && this._isFunctionLikeSymbol(targetSymbol.kind)
       && this._symbolNameMatchesWord(targetSymbol.name, word);
-    // 只有 targetSymbol 确实是查询的符号时，才把它加入 pathSymbolKeys
-	const targetMatchesWord = targetSimpleName === word;
-	const pathSymbolKeys = new Set<string>(ancestorPathSymbolKeys);
+    const targetMatchesWord = targetSimpleName === word;
+    const pathSymbolKeys = new Set<string>(ancestorPathSymbolKeys);
 
     const result: TreeNodeData[] = [];
-    // Tracks which enclosing symbols have already received an expandable nodeId
     const firstSeenKeys = new Set<string>();
 
-    // 用 LSP 结果判断 word 是局部变量还是静态全局变量：
-    // - 所有 LSP 引用都在同一函数内 → 局部变量
-    // - 所有 LSP 引用都在同一文件内，但跨函数 → 静态全局变量
     let targetFunction: { uri: string; startLine: number; endLine: number } | null = null;
     let targetFileOnly: string | null = null;
     let targetScope: { uri: string; startLine: number; endLine: number } | null = null;
     let targetDefinition: { uri: string; line: number } | null = null;
 
-    // 只对变量启用 targetDefinition 过滤，函数场景跳过
     if (!targetIsFunction) {
       try {
         const defs = await vscode.commands.executeCommand<vscode.Location[]>(
@@ -632,7 +627,6 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       if (isStale()) { return []; }
     }
 
-    // 先对光标位置调定义跳转，看它是否跳到某个作用域类符号内
     try {
       const cursorDefs = await vscode.commands.executeCommand<vscode.Location[]>(
         'vscode.executeDefinitionProvider', uri, pos
@@ -690,10 +684,12 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
           };
         }
       }
-    }   
-      for (const loc of locs) {
-        if (!this._passesFileFilter(loc.uri, session.includeGlob, session.excludeGlob)) {
-          continue;
+    }
+
+    for (const loc of locs) {
+      if (isStale()) { break; }
+      if (!this._passesFileFilter(loc.uri, session.includeGlob, session.excludeGlob)) {
+        continue;
       }
 
       let refDoc: vscode.TextDocument;
@@ -707,7 +703,6 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       const enclosing = this._deepestContaining(symbols, loc.range.start);
 
       if (!enclosing) {
-        // Reference at file/global scope — always show as leaf node (not expandable)
         result.push({
           nodeId: `leaf_${++session.nodeCounter}`,
           label: path.basename(loc.uri.fsPath) + ' (global)',
@@ -723,9 +718,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
         continue;
       }
 
-      // Skip self-reference: enclosing symbol IS the queried symbol itself
       const symStart = enclosing.selectionRange.start;
-      // 自引用跳过：只有 targetSymbol 名字匹配、且是函数时才跳过
       if (
         targetIsFunction &&
         targetMatchesWord &&
@@ -749,9 +742,8 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
         )
         : this._inferCppOwnerClass(enclosing.name, refDoc.lineAt(symStart.line).text, refDoc.languageId);
 
-      // Declaration symbol should not be considered as "referenced by its own definition".
       if (
-		!targetIsFunction &&
+        !targetIsFunction &&
         targetIsDeclaration &&
         !isDeclaration &&
         this._isFunctionLikeSymbol(enclosing.kind) &&
@@ -761,19 +753,17 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
         continue;
       }
 
-      // First occurrence of this enclosing symbol → expandable; subsequent → leaf
       const symKey = loc.uri.toString() + '#sym:' + symStart.line + ':' + symStart.character;
       if (pathSymbolKeys.has(symKey)) {
-		continue;
-	  }
-	  
+        continue;
+      }
+
       const isFirst = !firstSeenKeys.has(symKey);
       if (isFirst) { firstSeenKeys.add(symKey); }
 
       const nodeId = isFirst
         ? this._allocRefNodeId(session, loc.uri, symStart, new Set<string>([...pathSymbolKeys, symKey]))
         : `leaf_${++session.nodeCounter}`;
-		
 
       result.push({
         nodeId,
@@ -790,9 +780,6 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       });
     }
 
-    // ── 判断 LSP 结果是否完整，决定是否补充文本搜索 ──
-    // LSP 引用全部在同一个函数内 → 局部变量/形参，结果已精确，无需索引补充；
-    // 全工程同名异义的其他出现会被倒排索引扫出来，既慢又引入噪音。
     const lspAllInSameFunction = locs.length > 0 && targetSymbol &&
       this._simpleSymbolName(targetSymbol.name) !== word &&
       locs.every(loc =>
@@ -812,7 +799,6 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       result.push(...textResults);
     }
 
-    // 按文件路径 + 行号排序
     result.sort((a, b) => {
       if (a.uri !== b.uri) { return a.uri.localeCompare(b.uri); }
       const lineA = a.callLine != null ? a.callLine : a.line;
@@ -846,195 +832,195 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     const isStale = () => searchToken >= 0 && searchToken !== this._searchGen;
     if (isStale()) { return []; }
 
-    // ── 优先查倒排索引（不读缓存，索引查询本身够快） ──
-    const db = this._dbManager.getDb();
-    const indexedLocations = db.findWordLocations(word);
-    if (indexedLocations.length > 0) {
-      return this._resolveFromIndex(
-        session, word, wsRoot, existingUris, targetFunction, targetFileOnly, targetScope, targetDefinition, indexedLocations, searchToken
-      );
-    }
-
-    // ── 倒排索引没有，回退 rg，这里才用缓存 ──
-    const cacheKey = `${word}@${wsRoot}`;
-    if (this._textSearchCache.has(cacheKey)) {
-      return this._textSearchCache.get(cacheKey)!;
-    }
-    if (isStale()) { return []; }
-
-    const result: TreeNodeData[] = [];
-    const seen = new Set<string>(existingUris);
-    const commentStartCache = new Map<string, number[]>();
-    const inactiveCache = new Map<string, boolean[]>();
-
+    this._searchInFlight++;
     try {
-      const rgPath = await this._findRipgrep();
-      if (isStale()) { return []; }
-      if (!rgPath) { return []; }
-
-      const excludeGlobs = this._getCppExcludeGlobs();
-      const args = [
-        '--json',
-        '-w',
-        '--glob', '*.{c,h,cpp,hpp,cc,cxx,hxx}',
-        ...excludeGlobs.flatMap(g => ['--glob', g]),
-        word,
-        wsRoot,
-      ];
-
-      // 使用 AbortController 以便新搜索到达时中断 rg 进程
-      const ac = new AbortController();
-      this._activeRgAbort = ac;
-      let stdout = '';
-      try {
-        const result = await execFileAsync(rgPath, args, {
-          maxBuffer: 10 * 1024 * 1024,
-          signal: ac.signal,
-        });
-        stdout = result.stdout;
-      } catch (e: any) {
-        if (e && e.name === 'AbortError') {
-          // 被新搜索中断，直接返回空
-          return [];
-        }
-        return result;
-      } finally {
-        if (this._activeRgAbort === ac) {
-          this._activeRgAbort = null;
-        }
-      }
-      if (isStale()) { return []; }
-
-      const lines = stdout.split('\n').filter(Boolean);
       const db = this._dbManager.getDb();
+      const indexedLocations = db.findWordLocations(word);
+      if (indexedLocations.length > 0) {
+        return await this._resolveFromIndex(
+          session, word, wsRoot, existingUris, targetFunction, targetFileOnly, targetScope, targetDefinition, indexedLocations, searchToken
+        );
+      }
 
-      for (const line of lines) {
-        let match: any;
-        try { match = JSON.parse(line); } catch { continue; }
-        if (match.type !== 'match') { continue; }
+      const cacheKey = `${word}@${wsRoot}`;
+      if (this._textSearchCache.has(cacheKey)) {
+        return this._textSearchCache.get(cacheKey)!;
+      }
+      if (isStale()) { return []; }
 
-        const data = match.data;
-        if (!data || !data.path || !data.line_number) { continue; }
+      const result: TreeNodeData[] = [];
+      const seen = new Set<string>(existingUris);
+      const commentStartCache = new Map<string, number[]>();
+      const inactiveCache = new Map<string, boolean[]>();
 
-        const filePath = data.path.text;
-        const lineNum = data.line_number - 1;
-        const uriStr = vscode.Uri.file(filePath).toString();
-        const submatches = data.submatches || [];
+      try {
+        const rgPath = await this._findRipgrep();
+        if (isStale()) { return []; }
+        if (!rgPath) { return []; }
 
-        let doc: vscode.TextDocument | undefined;
+        const excludeGlobs = this._getCppExcludeGlobs();
+        const args = [
+          '--json',
+          '-w',
+          '--glob', '*.{c,h,cpp,hpp,cc,cxx,hxx}',
+          ...excludeGlobs.flatMap(g => ['--glob', g]),
+          word,
+          wsRoot,
+        ];
+
+        const ac = new AbortController();
+        this._activeRgAbort = ac;
+ 
+        let stdout = '';
         try {
-          doc = await vscode.workspace.openTextDocument(vscode.Uri.file(filePath));
-        } catch { continue; }
-        if (isStale()) { break; }
-
-        let commentStartCols = commentStartCache.get(filePath);
-        if (!commentStartCols) {
-          commentStartCols = this._computeCommentLines(doc);
-          commentStartCache.set(filePath, commentStartCols);
+          const result = await execFileAsync(rgPath, args, {
+            maxBuffer: 10 * 1024 * 1024,
+            signal: ac.signal,
+          });
+          stdout = result.stdout;
+      
+        } catch (e: any) {
+          if (e && e.name === 'AbortError') {
+            return [];
+          }
+          return result;
+        } finally {
+          if (this._activeRgAbort === ac) {
+            this._activeRgAbort = null;
+          }
         }
+        if (isStale()) { return []; }
 
-        let inactiveLines = inactiveCache.get(filePath);
-        if (!inactiveLines) {
-          inactiveLines = this._computeInactiveLines(doc);
-          inactiveCache.set(filePath, inactiveLines);
-        }
+        const lines = stdout.split('\n').filter(Boolean);
+        const db = this._dbManager.getDb();
 
-        for (const submatch of submatches) {
-          const startCol = submatch.start;
-          const key = `${uriStr}#${lineNum}:${startCol}`;
-          if (seen.has(key)) { continue; }
-          seen.add(key);
+        for (const line of lines) {
+          if (isStale()) { break; }
+          let match: any;
+          try { match = JSON.parse(line); } catch { continue; }
+          if (match.type !== 'match') { continue; }
 
-          // 排除注释里的匹配
-          if (commentStartCols[lineNum] >= 0 && startCol >= commentStartCols[lineNum]) { continue; }
+          const data = match.data;
+          if (!data || !data.path || !data.line_number) { continue; }
 
-          // 排除 #if 0 块里的匹配
-          if (inactiveLines[lineNum]) { continue; }
+          const filePath = data.path.text;
+          const lineNum = data.line_number - 1;
+          const uriStr = vscode.Uri.file(filePath).toString();
+          const submatches = data.submatches || [];
 
-          // 排除字符串字面量里的匹配（#include 行除外）
-          const lineText = doc.lineAt(lineNum).text;
-          const isIncludeLine = /^\s*#\s*include\b/.test(lineText);
-          if (!isIncludeLine) {
-            const beforeMatch = lineText.slice(0, startCol);
-            const quoteCount = (beforeMatch.match(/"/g) || []).length;
-            if (quoteCount % 2 === 1) { continue; }
+          let doc: vscode.TextDocument | undefined;
+          try {
+            doc = await vscode.workspace.openTextDocument(vscode.Uri.file(filePath));
+          } catch { continue; }
+          if (isStale()) { break; }
+
+          let commentStartCols = commentStartCache.get(filePath);
+          if (!commentStartCols) {
+            commentStartCols = this._computeCommentLines(doc);
+            commentStartCache.set(filePath, commentStartCols);
           }
 
-          const enclosing = db.findEnclosingSymbol(filePath, lineNum);
-
-          if (targetFunction) {
-            const sameFile = uriStr === targetFunction.uri;
-            const inSameFunction = enclosing
-              && enclosing.range_start_line === targetFunction.startLine
-              && enclosing.range_end_line === targetFunction.endLine;
-            if (!sameFile || !inSameFunction) { continue; }
+          let inactiveLines = inactiveCache.get(filePath);
+          if (!inactiveLines) {
+            inactiveLines = this._computeInactiveLines(doc);
+            inactiveCache.set(filePath, inactiveLines);
           }
 
-          if (targetFileOnly && uriStr !== targetFileOnly) { continue; }
-
-          if (targetScope) {
-            const sameFile = uriStr === targetScope.uri;
-            if (!sameFile) { continue; }
-            const inScope = await this._isDefinitionInScope(filePath, lineNum, startCol, targetScope);
+          for (const submatch of submatches) {
             if (isStale()) { break; }
-            if (!inScope) { continue; }
-          }
+            const startCol = submatch.start;
+            const key = `${uriStr}#${lineNum}:${startCol}`;
+            if (seen.has(key)) { continue; }
+            seen.add(key);
 
-          // 用定义跳转对比，区分全局变量和结构体成员
-          if (targetDefinition) {
-            const memberDef = await this._resolveMemberDefinition(filePath, lineNum, startCol);
-            if (isStale()) { break; }
-            if (!memberDef) { continue; }
-            if (memberDef.uri !== targetDefinition.uri || memberDef.line !== targetDefinition.line) {
-              continue;
+            if (commentStartCols[lineNum] >= 0 && startCol >= commentStartCols[lineNum]) { continue; }
+            if (inactiveLines[lineNum]) { continue; }
+
+            const lineText = doc.lineAt(lineNum).text;
+            const isIncludeLine = /^\s*#\s*include\b/.test(lineText);
+            if (!isIncludeLine) {
+              const beforeMatch = lineText.slice(0, startCol);
+              const quoteCount = (beforeMatch.match(/"/g) || []).length;
+              if (quoteCount % 2 === 1) { continue; }
             }
-	  }
 
-        const enclosingName = enclosing ? enclosing.name : '';
-        const enclosingStart = enclosing
-          ? { line: enclosing.selection_start_line, char: enclosing.selection_start_char }
-          : { line: lineNum, char: startCol };
+            const enclosing = db.findEnclosingSymbol(filePath, lineNum);
 
-        const nodeId = enclosing
-          ? this._allocRefNodeId(
-              session,
-              vscode.Uri.file(filePath),
-              new vscode.Position(enclosingStart.line, enclosingStart.char),
-              new Set<string>()
-            )
-          : `leaf_${++session.nodeCounter}`;
+            if (targetFunction) {
+              const sameFile = uriStr === targetFunction.uri;
+              const inSameFunction = enclosing
+                && enclosing.range_start_line === targetFunction.startLine
+                && enclosing.range_end_line === targetFunction.endLine;
+              if (!sameFile || !inSameFunction) { continue; }
+            }
 
-        result.push({
-          nodeId,
-          label: enclosingName || word,
-          detail: this._relativePath(filePath, wsRoot),
-          line: enclosingStart.line,
-          character: enclosingStart.char,
-          callLine: lineNum,
-          callCharacter: startCol,
-          uri: uriStr,
-          kind: enclosing ? 'Function' : 'TextMatch',
-          isDeclaration: false,
-          isTextSearch: true,
-          preview: '',
-        });
+            if (targetFileOnly && uriStr !== targetFileOnly) { continue; }
+
+            if (targetScope) {
+              const sameFile = uriStr === targetScope.uri;
+              if (!sameFile) { continue; }
+              const inScope = await this._isDefinitionInScope(filePath, lineNum, startCol, targetScope);
+              if (isStale()) { break; }
+              if (!inScope) { continue; }
+            }
+
+            if (targetDefinition) {
+              const memberDef = await this._resolveMemberDefinition(filePath, lineNum, startCol);
+              if (isStale()) { break; }
+              if (!memberDef) { continue; }
+              if (memberDef.uri !== targetDefinition.uri || memberDef.line !== targetDefinition.line) {
+                continue;
+              }
+            }
+
+            const enclosingName = enclosing ? enclosing.name : '';
+            const enclosingStart = enclosing
+              ? { line: enclosing.selection_start_line, char: enclosing.selection_start_char }
+              : { line: lineNum, char: startCol };
+
+            const nodeId = enclosing
+              ? this._allocRefNodeId(
+                  session,
+                  vscode.Uri.file(filePath),
+                  new vscode.Position(enclosingStart.line, enclosingStart.char),
+                  new Set<string>()
+                )
+              : `leaf_${++session.nodeCounter}`;
+
+            result.push({
+              nodeId,
+              label: enclosingName || word,
+              detail: this._relativePath(filePath, wsRoot),
+              line: enclosingStart.line,
+              character: enclosingStart.char,
+              callLine: lineNum,
+              callCharacter: startCol,
+              uri: uriStr,
+              kind: enclosing ? 'Function' : 'TextMatch',
+              isDeclaration: false,
+              isTextSearch: true,
+              preview: '',
+            });
+          }
+        }
+      } catch {
+        // rg 不可用，静默返回
+      }
+
+      if (this._textSearchCache.size > 100) {
+        const firstKey = this._textSearchCache.keys().next().value;
+        if (firstKey !== undefined) {
+          this._textSearchCache.delete(firstKey);
         }
       }
-    } catch {
-      // rg 不可用，静默返回
-    }
+      this._textSearchCache.set(cacheKey, result);
 
-    // ── rg 结果写缓存，限制大小 ──
-    if (this._textSearchCache.size > 100) {
-      const firstKey = this._textSearchCache.keys().next().value;
-      if (firstKey !== undefined) {
-        this._textSearchCache.delete(firstKey);
-      }
+      return result;
+    } finally {
+      this._searchInFlight--;
     }
-    this._textSearchCache.set(cacheKey, result);
-
-    return result;
   }
+
   /**
    * 用倒排索引的结果构建 TreeNodeData[]。
    */
@@ -1056,106 +1042,103 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     searchToken: number = -1
   ): Promise<TreeNodeData[]> {
     const isStale = () => searchToken >= 0 && searchToken !== this._searchGen;
-    const result: TreeNodeData[] = [];
-    const seen = new Set<string>(existingUris);
-    const commentStartCache = new Map<string, number[]>();
-    const inactiveCache = new Map<string, boolean[]>();
-    const db = this._dbManager.getDb();
 
-    // 按文件分组
-    const byFile = new Map<string, WordLocation[]>();
-    for (const loc of indexedLocations) {
-      let list = byFile.get(loc.file_path);
-      if (!list) { list = []; byFile.set(loc.file_path, list); }
-      list.push(loc);
-    }
+    this._searchInFlight++;
+    try {
+      const result: TreeNodeData[] = [];
+      const seen = new Set<string>(existingUris);
+      const commentStartCache = new Map<string, number[]>();
+      const inactiveCache = new Map<string, boolean[]>();
+      const db = this._dbManager.getDb();
 
-    for (const [filePath, locations] of byFile.entries()) {
-      const fileUriStr = vscode.Uri.file(filePath).toString();
-
-      // ── 提前按作用域裁剪，跳过无关文件，省掉 openTextDocument ──
-      if (targetFileOnly && fileUriStr !== targetFileOnly) { continue; }
-      if (targetFunction) {
-        if (fileUriStr !== targetFunction.uri) { continue; }
-        // 同一文件下，只保留落在函数行范围内的位置
-        const inRange = locations.filter(loc =>
-          loc.line >= targetFunction!.startLine && loc.line <= targetFunction!.endLine
-        );
-        if (inRange.length === 0) { continue; }
-        byFile.set(filePath, inRange);
-      }
-      if (targetScope && fileUriStr !== targetScope.uri) { continue; }
-
-      let doc: vscode.TextDocument;
-      try {
-        doc = await vscode.workspace.openTextDocument(vscode.Uri.file(filePath));
-      } catch { continue; }
-      if (isStale()) { break; }
-
-      let commentStartCols = commentStartCache.get(filePath);
-      if (!commentStartCols) {
-        commentStartCols = this._computeCommentLines(doc);
-        commentStartCache.set(filePath, commentStartCols);
+      const byFile = new Map<string, WordLocation[]>();
+      for (const loc of indexedLocations) {
+        let list = byFile.get(loc.file_path);
+        if (!list) { list = []; byFile.set(loc.file_path, list); }
+        list.push(loc);
       }
 
-      let inactiveLines = inactiveCache.get(filePath);
-      if (!inactiveLines) {
-        inactiveLines = this._computeInactiveLines(doc);
-        inactiveCache.set(filePath, inactiveLines);
-      }
+      for (const [filePath, locations] of byFile.entries()) {
+        if (isStale()) { break; }
+        const fileUriStr = vscode.Uri.file(filePath).toString();
 
-      const uriStr = fileUriStr;
-
-      for (const loc of locations) {
-        const lineNum = loc.line;
-        const startCol = loc.char;
-        const key = `${uriStr}#${lineNum}:${startCol}`;
-        if (seen.has(key)) { continue; }
-        seen.add(key);
-
-        // 注释过滤
-        if (commentStartCols[lineNum] >= 0 && startCol >= commentStartCols[lineNum]) { continue; }
-
-        // #if 0 过滤
-        if (inactiveLines[lineNum]) { continue; }
-
-        // 字符串过滤
-        const lineText = doc.lineAt(lineNum).text;
-        const isIncludeLine = /^\s*#\s*include\b/.test(lineText);
-        if (!isIncludeLine) {
-          const beforeMatch = lineText.slice(0, startCol);
-          const quoteCount = (beforeMatch.match(/"/g) || []).length;
-          if (quoteCount % 2 === 1) { continue; }
-        }
-
-        // 局部变量/静态全局变量过滤
-        const enclosing = db.findEnclosingSymbol(filePath, lineNum);
+        if (targetFileOnly && fileUriStr !== targetFileOnly) { continue; }
         if (targetFunction) {
-          const sameFile = uriStr === targetFunction.uri;
-          const inSameFunction = enclosing
-            && enclosing.range_start_line === targetFunction.startLine
-            && enclosing.range_end_line === targetFunction.endLine;
-          if (!sameFile || !inSameFunction) { continue; }
+          if (fileUriStr !== targetFunction.uri) { continue; }
+          const inRange = locations.filter(loc =>
+            loc.line >= targetFunction!.startLine && loc.line <= targetFunction!.endLine
+          );
+          if (inRange.length === 0) { continue; }
+          byFile.set(filePath, inRange);
         }
-        if (targetFileOnly && uriStr !== targetFileOnly) { continue; }
+        if (targetScope && fileUriStr !== targetScope.uri) { continue; }
 
-        if (targetScope) {
-          const sameFile = uriStr === targetScope.uri;
-          if (!sameFile) { continue; }
-          const inScope = await this._isDefinitionInScope(filePath, lineNum, startCol, targetScope);
-          if (isStale()) { break; }
-          if (!inScope) { continue; }
+        let doc: vscode.TextDocument;
+        try {
+          doc = await vscode.workspace.openTextDocument(vscode.Uri.file(filePath));
+        } catch { continue; }
+        if (isStale()) { break; }
+
+        let commentStartCols = commentStartCache.get(filePath);
+        if (!commentStartCols) {
+          commentStartCols = this._computeCommentLines(doc);
+          commentStartCache.set(filePath, commentStartCols);
         }
 
-        // 用定义跳转对比，区分全局变量和结构体成员
-        if (targetDefinition) {
-          const memberDef = await this._resolveMemberDefinition(filePath, lineNum, startCol);
+        let inactiveLines = inactiveCache.get(filePath);
+        if (!inactiveLines) {
+          inactiveLines = this._computeInactiveLines(doc);
+          inactiveCache.set(filePath, inactiveLines);
+        }
+
+        const uriStr = fileUriStr;
+
+        for (const loc of locations) {
           if (isStale()) { break; }
-          if (!memberDef) { continue; }
-          if (memberDef.uri !== targetDefinition.uri || memberDef.line !== targetDefinition.line) {
-            continue;
+          const lineNum = loc.line;
+          const startCol = loc.char;
+          const key = `${uriStr}#${lineNum}:${startCol}`;
+          if (seen.has(key)) { continue; }
+          seen.add(key);
+
+          if (commentStartCols[lineNum] >= 0 && startCol >= commentStartCols[lineNum]) { continue; }
+          if (inactiveLines[lineNum]) { continue; }
+
+          const lineText = doc.lineAt(lineNum).text;
+          const isIncludeLine = /^\s*#\s*include\b/.test(lineText);
+          if (!isIncludeLine) {
+            const beforeMatch = lineText.slice(0, startCol);
+            const quoteCount = (beforeMatch.match(/"/g) || []).length;
+            if (quoteCount % 2 === 1) { continue; }
           }
-        }
+
+          const enclosing = db.findEnclosingSymbol(filePath, lineNum);
+          if (targetFunction) {
+            const sameFile = uriStr === targetFunction.uri;
+            const inSameFunction = enclosing
+              && enclosing.range_start_line === targetFunction.startLine
+              && enclosing.range_end_line === targetFunction.endLine;
+            if (!sameFile || !inSameFunction) { continue; }
+          }
+          if (targetFileOnly && uriStr !== targetFileOnly) { continue; }
+
+          if (targetScope) {
+            const sameFile = uriStr === targetScope.uri;
+            if (!sameFile) { continue; }
+            const inScope = await this._isDefinitionInScope(filePath, lineNum, startCol, targetScope);
+            if (isStale()) { break; }
+            if (!inScope) { continue; }
+          }
+
+          if (targetDefinition) {
+            const memberDef = await this._resolveMemberDefinition(filePath, lineNum, startCol);
+            if (isStale()) { break; }
+            if (!memberDef) { continue; }
+            if (memberDef.uri !== targetDefinition.uri || memberDef.line !== targetDefinition.line) {
+              continue;
+            }
+          }
+
           const enclosingName = enclosing ? enclosing.name : '';
           const enclosingStart = enclosing
             ? { line: enclosing.selection_start_line, char: enclosing.selection_start_char }
@@ -1184,16 +1167,15 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
             isTextSearch: true,
             preview: '',
           });
+        }
       }
-    }
 
-    return result;
+      return result;
+    } finally {
+      this._searchInFlight--;
+    }
   }
 
-  /**
-   * 对匹配位置调定义跳转，返回定义位置（用于判断结构体成员归属）。
-   * 结果缓存，避免重复调用。
-   */
   private async _resolveMemberDefinition(
     filePath: string,
     line: number,
@@ -1232,9 +1214,6 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     return result;
   }
 
-  /**
-   * 判断定义位置是否在指定的作用域范围内。
-   */
   private async _isDefinitionInScope(
     filePath: string,
     line: number,
@@ -1274,9 +1253,6 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     return null;
   }
 
-  /**
-   * 读取 C_Cpp.files.exclude 配置，转换成 rg 的排除 glob。
-   */
   private _getCppExcludeGlobs(): string[] {
     const excludeGlobs: string[] = [];
     try {
@@ -1293,11 +1269,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     }
     return excludeGlobs;
   }
-  
-  /**
-   * 扫描整个文件，返回每一行的注释起始列。
-   * -1 表示该行没有注释；>= 0 表示从该列开始是注释。
-   */
+
   private _computeCommentLines(doc: vscode.TextDocument): number[] {
     const lines = doc.lineCount;
     const commentStartCols: number[] = new Array(lines).fill(-1);
@@ -1338,10 +1310,6 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     return commentStartCols;
   }
 
-  /**
-   * 扫描整个文件，返回每一行是否在 #if 0 块中。
-   * 只处理 #if 0 和 #endif 的简单配对，不处理嵌套和 #else。
-   */
   private _computeInactiveLines(doc: vscode.TextDocument): boolean[] {
     const lines = doc.lineCount;
     const inactive: boolean[] = new Array(lines).fill(false);
@@ -1366,11 +1334,10 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
 
     return inactive;
   }
-  // ── Expand: Reference hierarchy ────────────────────────────────────────────
 
   private async _expandRef(instanceId: string, nodeId: string): Promise<void> {
     if (!this._view) { return; }
-    const mySearchId = this._searchGen; // 展开时不抢占令牌，只检查是否被新搜索作废
+    const mySearchId = this._searchGen;
     const session = this._getOrCreateSession(instanceId);
     const info = session.refNodeMap.get(nodeId);
     if (!info) {
@@ -1404,7 +1371,6 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  /** Recursively find the innermost symbol whose range contains `pos`. */
   private _deepestContaining(
     symbols: vscode.DocumentSymbol[],
     pos: vscode.Position
@@ -1546,8 +1512,6 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
   private _rangeSize(r: vscode.Range): number {
     return (r.end.line - r.start.line) * 10000 + (r.end.character - r.start.character);
   }
-
-  // ── Generic helpers ────────────────────────────────────────────────────────
 
   private _relativePath(fsPath: string, wsRoot: string): string {
     if (wsRoot && fsPath.startsWith(wsRoot)) {
@@ -1707,15 +1671,9 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       min-width: 0;
       display: flex;
     }
-    #pane-host.mode-single {
-      flex-direction: column;
-    }
-    #pane-host.mode-horizontal {
-      flex-direction: column;
-    }
-    #pane-host.mode-vertical {
-      flex-direction: row;
-    }
+    #pane-host.mode-single { flex-direction: column; }
+    #pane-host.mode-horizontal { flex-direction: column; }
+    #pane-host.mode-vertical { flex-direction: row; }
     .pane-shell {
       flex: 1;
       min-height: 0;
@@ -1811,9 +1769,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
       z-index: 1000;
     }
-    .instance-context-menu[hidden] {
-      display: none;
-    }
+    .instance-context-menu[hidden] { display: none; }
     .instance-context-item {
       width: 100%;
       height: 24px;
@@ -1839,9 +1795,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
       z-index: 1050;
     }
-    .node-context-menu[hidden] {
-      display: none;
-    }
+    .node-context-menu[hidden] { display: none; }
     .node-context-item {
       width: 100%;
       height: 24px;
@@ -1867,9 +1821,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
       z-index: 1100;
     }
-    #split-context-menu[hidden] {
-      display: none;
-    }
+    #split-context-menu[hidden] { display: none; }
     .split-context-item {
       width: 100%;
       height: 24px;
@@ -1886,7 +1838,6 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       background: var(--vscode-list-hoverBackground, rgba(255,255,255,0.08));
     }
 
-    /* ── Header ─────────────────────────────────────────────────── */
     #header {
       display: flex;
       align-items: center;
@@ -1954,9 +1905,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       color: var(--vscode-foreground, #d4d4d4);
       border-right: 1px solid var(--vscode-panel-border, #333);
     }
-    .view-tab:last-child {
-      border-right: none;
-    }
+    .view-tab:last-child { border-right: none; }
     .view-tab.active {
       background: var(--vscode-tab-activeBackground, #1e1e1e);
       color: var(--vscode-tab-activeForeground, #fff);
@@ -1993,9 +1942,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       align-items: center;
       flex-shrink: 0;
     }
-    #file-filters[hidden] {
-      display: none;
-    }
+    #file-filters[hidden] { display: none; }
     #file-filters label {
       font-size: 11px;
       color: var(--vscode-descriptionForeground, #858585);
@@ -2013,7 +1960,6 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       padding: 0 6px;
     }
 
-    /* ── Content ────────────────────────────────────────────────── */
     #empty-msg {
       display: flex;
       align-items: center;
@@ -2033,8 +1979,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     .section { display: none; }
     .section.active { display: block; }
 
-    /* ── Tree items ─────────────────────────────────────────────── */
-    .tree-node { /* container for row + children */ }
+    .tree-node { }
     .tree-row {
       display: grid;
       grid-template-columns: minmax(0, var(--mapview-name-col-width, 1fr)) 8px var(--mapview-file-col-width, 140px) 8px var(--mapview-line-col-width, 50px);
@@ -2157,15 +2102,9 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       user-select: none;
       touch-action: none;
     }
-    .tree-row .col-splitter {
-      min-height: 100%;
-    }
-    .table-header .col-splitter {
-      cursor: col-resize;
-    }
-    .tree-row .col-splitter {
-      cursor: col-resize;
-    }
+    .tree-row .col-splitter { min-height: 100%; }
+    .table-header .col-splitter { cursor: col-resize; }
+    .tree-row .col-splitter { cursor: col-resize; }
     .col-splitter::before {
       content: '';
       position: absolute;
@@ -2197,17 +2136,11 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     }
     .table-header .col-name { padding-left: 28px; }
     .tree-row .col-name { min-width: 0; }
-    .pane-shell.dragging-columns {
-      cursor: col-resize;
-    }
-    .tree-children { /* nested children container */ }
+    .pane-shell.dragging-columns { cursor: col-resize; }
+    .tree-children { }
 
-    /* ── Leaf (non-expandable) tree items ────────────────────────── */
-    .tree-node[data-leaf="1"] .tree-toggle {
-      visibility: hidden;
-    }
+    .tree-node[data-leaf="1"] .tree-toggle { visibility: hidden; }
 
-    /* ── Empty section placeholder ──────────────────────────────── */
     .section-empty {
       padding: 20px;
       text-align: center;
@@ -2216,7 +2149,6 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       font-style: italic;
     }
 
-    /* ── Graph view ─────────────────────────────────────────────── */
     #graph-container {
       position: relative;
       flex: 1;
@@ -2254,7 +2186,6 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       background: var(--vscode-button-background, #0e639c);
     }
   </style>
-  <!-- Dynamic theme symbol-kind colors (updated via postMessage on theme change) -->
   <style id="theme-tokens">${initialThemeCss}</style>
 </head>
 <body>
@@ -2403,25 +2334,22 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     let nodeContextMenuState = null;
 
     let loadedNodes = new Set();
-    let nodeChildrenCache = new Map();  // nodeId → children items[]
-    let expandedNodeIds = new Set();    // nodeIds currently expanded
+    let nodeChildrenCache = new Map();
+    let expandedNodeIds = new Set();
     let selectedTreeNodeId = '';
     let nameColumnWidth = DEFAULT_NAME_COLUMN_WIDTH;
     let fileColumnWidth = DEFAULT_FILE_COLUMN_WIDTH;
     let lineColumnWidth = DEFAULT_LINE_COLUMN_WIDTH;
     let columnDragState = null;
 
-    // ── View mode: 'tree' | 'graph' ─────────────────────────────────────
     let viewMode = 'tree';
-    let graphDirection = 'right'; // 'up' | 'down' | 'left' | 'right'
+    let graphDirection = 'right';
     let outlineQualifiedNameDisplay = 'twoLine';
-    // Store last update data for graph rendering
     let lastUpdateData = null;
 
     function createInstanceState(id, title, mode, direction) {
       return {
-        id,
-        title,
+        id, title,
         viewMode: mode,
         graphDirection: direction,
         loadedNodes: new Set(),
@@ -2439,13 +2367,9 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     }
 
     function normalizeColumnWidth(value, fallback, minWidth, maxWidth) {
-      if (value == null) {
-        return fallback;
-      }
+      if (value == null) { return fallback; }
       const width = Number(value);
-      if (!Number.isFinite(width)) {
-        return fallback;
-      }
+      if (!Number.isFinite(width)) { return fallback; }
       return Math.max(minWidth, Math.min(maxWidth, Math.round(width)));
     }
 
@@ -2499,27 +2423,15 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
 
     function cloneLastUpdateData(data) {
       if (!data) { return null; }
-      try {
-        return JSON.parse(JSON.stringify(data));
-      } catch {
-        return null;
-      }
+      try { return JSON.parse(JSON.stringify(data)); } catch { return null; }
     }
 
     function insertInstanceOrder(instanceId, afterInstanceId) {
       const existingIdx = instanceOrder.indexOf(instanceId);
-      if (existingIdx >= 0) {
-        instanceOrder.splice(existingIdx, 1);
-      }
-      if (!afterInstanceId) {
-        instanceOrder.push(instanceId);
-        return;
-      }
+      if (existingIdx >= 0) { instanceOrder.splice(existingIdx, 1); }
+      if (!afterInstanceId) { instanceOrder.push(instanceId); return; }
       const idx = instanceOrder.indexOf(afterInstanceId);
-      if (idx < 0) {
-        instanceOrder.push(instanceId);
-        return;
-      }
+      if (idx < 0) { instanceOrder.push(instanceId); return; }
       instanceOrder.splice(idx + 1, 0, instanceId);
     }
 
@@ -2604,9 +2516,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     function activateInstance(instanceId) {
       const next = instanceStateMap.get(instanceId);
       if (!next) return;
-      if (activeInstanceId) {
-        syncActiveState();
-      }
+      if (activeInstanceId) { syncActiveState(); }
       bindInstanceState(next);
       renderInstanceTabs();
       applyActiveStateUi();
@@ -2624,10 +2534,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       } else {
         title = title || id;
       }
-      if (instanceStateMap.has(id)) {
-        activateInstance(id);
-        return id;
-      }
+      if (instanceStateMap.has(id)) { activateInstance(id); return id; }
       const mode = normalizeViewMode(opts.mode || defaultNewMode);
       const direction = normalizeGraphDirection(opts.direction || defaultNewDirection);
       const state = createInstanceState(id, title, mode, direction);
@@ -2656,17 +2563,12 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       if (instanceStateMap.size === 1 && !opts.force) return;
       const idx = instanceOrder.indexOf(instanceId);
       instanceStateMap.delete(instanceId);
-      if (idx >= 0) {
-        instanceOrder.splice(idx, 1);
-      }
+      if (idx >= 0) { instanceOrder.splice(idx, 1); }
       if (!opts.skipCloseMessage) {
         vscodeApi.postMessage({ type: 'closeInstance', instanceId });
       }
       hideInstanceContextMenu();
-      if (instanceOrder.length === 0) {
-        addInstance();
-        return;
-      }
+      if (instanceOrder.length === 0) { addInstance(); return; }
       const nextId = instanceOrder[idx] || instanceOrder[idx - 1] || instanceOrder[0];
       activateInstance(nextId);
     }
@@ -2685,7 +2587,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
           nodeChildrenCache: cloneNodeChildrenCache(state.nodeChildrenCache),
           expandedNodeIds: new Set(state.expandedNodeIds),
           lastUpdateData: cloneLastUpdateData(state.lastUpdateData),
-            selectedTreeNodeId: state.selectedTreeNodeId,
+          selectedTreeNodeId: state.selectedTreeNodeId,
           nameColumnWidth: state.nameColumnWidth,
           fileColumnWidth: state.fileColumnWidth,
           lineColumnWidth: state.lineColumnWidth,
@@ -2825,10 +2727,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
 
     instanceTabs.addEventListener('click', (event) => {
       const addBtn = event.target.closest('#instance-add-btn');
-      if (addBtn) {
-        addInstance();
-        return;
-      }
+      if (addBtn) { addInstance(); return; }
       const closeBtn = event.target.closest('.instance-tab-close');
       if (closeBtn) {
         event.stopPropagation();
@@ -2916,9 +2815,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       graphDirectionWrap.style.display = graphActive ? 'inline-flex' : 'none';
     }
 
-    function isGraphMode(mode) {
-      return mode === 'graph';
-    }
+    function isGraphMode(mode) { return mode === 'graph'; }
 
     function normalizeViewMode(mode) {
       return mode === 'graph' || mode === 'graph-up' ? 'graph' : 'tree';
@@ -3041,19 +2938,13 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     viewTabGraph.addEventListener('click', () => setViewState('graph', graphDirection));
     graphDirectionSelect.addEventListener('change', () => setViewState('graph', graphDirectionSelect.value));
 
-    // ── Search button ────────────────────────────────────────────────────
     fileFiltersToggle.addEventListener('click', () => {
       applyFileFilterUi(fileFilters.hidden);
       syncActiveState();
     });
 
-    includeGlobInput.addEventListener('input', () => {
-      syncActiveState();
-    });
-
-    excludeGlobInput.addEventListener('input', () => {
-      syncActiveState();
-    });
+    includeGlobInput.addEventListener('input', () => { syncActiveState(); });
+    excludeGlobInput.addEventListener('input', () => { syncActiveState(); });
 
     includeGlobInput.addEventListener('keydown', (event) => {
       if (event.key !== 'Enter') { return; }
@@ -3089,7 +2980,6 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       vscodeApi.postMessage({ type: 'toggleLock', locked: !isLocked });
     });
 
-    // ── Messages from extension ──────────────────────────────────────────
     function handleMessage(msg) {
       const msgInstanceId = msg && typeof msg.instanceId === 'string' ? msg.instanceId : activeInstanceId;
       if (msg.type === 'lockState') {
@@ -3122,7 +3012,6 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
 
       if (msg.type === 'themeColors') {
         document.getElementById('theme-tokens').textContent = msg.css;
-        // Redraw graph in case it's visible, so node border colors update
         if (isGraphMode(viewMode) && lastUpdateData) { graphDraw(); }
         return;
       }
@@ -3186,11 +3075,8 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
           expandedNodeIds.add(rootNode.nodeId);
         }
 
-        // Tree view (root node included)
         renderTreeList(refSection, rootNode ? [rootNode] : (d.refNodes || []), 0);
-        if (rootNode) {
-          restoreTreeExpansions(refSection);
-        }
+        if (rootNode) { restoreTreeExpansions(refSection); }
         applyTreeSelectionUi();
 
         if (viewMode === 'tree') {
@@ -3205,7 +3091,6 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
         return;
       }
 
-      // Children for a tree node (incremental expansion)
       if (msg.type === 'children') {
         if (msgInstanceId !== activeInstanceId) { return; }
         const parentNodeId = msg.parentNodeId;
@@ -3214,13 +3099,11 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
         expandedNodeIds.add(parentNodeId);
         syncActiveState();
 
-        // ── Graph expand ──────────────────────────────────────────
         if (isGraphMode(viewMode)) {
           graphHandleChildren(parentNodeId, msg.items || []);
           return;
         }
 
-        // ── Tree expand ───────────────────────────────────────────
         const nodeEl = paneRoot.querySelector('[data-node-id="' + parentNodeId + '"]');
         if (!nodeEl) return;
         const toggleEl = nodeEl.querySelector(':scope > .tree-row .tree-toggle');
@@ -3245,14 +3128,12 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       }
     }
 
-    // ── Render helpers ───────────────────────────────────────────────────
     function escapeHtml(s) {
       return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
     }
     function escapeAttr(s) {
       return s.replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
     }
-    /** Strip function parameters: "foo(a, b)" → "foo" */
     function stripParams(name) {
       const idx = name.indexOf('(');
       return idx > 0 ? name.substring(0, idx) : name;
@@ -3327,29 +3208,17 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       }).join('');
     }
 
-        function renderTreeNodeHtml(item, depth) {
+    function renderTreeNodeHtml(item, depth) {
       const pad = depth * 16;
       const isLeaf = item.nodeId.startsWith('leaf_');
       const nameHtml = renderOutlineNameHtml(item.label, item.kind || 'Function', outlineQualifiedNameDisplay);
 
       const kindTitleMap = {
-        'Function': '函数',
-        'Method': '方法',
-        'Constructor': '构造函数',
-        'Variable': '变量',
-        'Constant': '常量',
-        'Field': '字段',
-        'Property': '属性',
-        'Class': '类',
-        'Struct': '结构体',
-        'Interface': '接口',
-        'Enum': '枚举',
-        'EnumMember': '枚举成员',
-        'Namespace': '命名空间',
-        'Module': '模块',
-        'File': '文件',
-        'Global': '全局作用域',
-        'TextMatch': '文本匹配',
+        'Function': '函数', 'Method': '方法', 'Constructor': '构造函数',
+        'Variable': '变量', 'Constant': '常量', 'Field': '字段', 'Property': '属性',
+        'Class': '类', 'Struct': '结构体', 'Interface': '接口', 'Enum': '枚举',
+        'EnumMember': '枚举成员', 'Namespace': '命名空间', 'Module': '模块',
+        'File': '文件', 'Global': '全局作用域', 'TextMatch': '文本匹配',
       };
       const iconTitle = item.isTextSearch
         ? '文本匹配：由 ripgrep 搜索找到，未经 LSP 语义确认，可能是注释或字符串里的误报'
@@ -3380,9 +3249,6 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
         + '</div>';
     }
 
-    // ── Restore expansion state helpers ──────────────────────────────────
-
-    /** Recursively restore tree node expansions from shared state */
     function restoreTreeExpansions(containerEl) {
       const treeNodes = containerEl.querySelectorAll(':scope > .tree-node');
       for (const nodeEl of treeNodes) {
@@ -3399,13 +3265,11 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
             return renderTreeNodeHtml(item, depth);
           }).join('');
           loadedNodes.add(nodeId);
-          // Recurse into children
           restoreTreeExpansions(childrenEl);
         }
       }
     }
 
-    /** Recursively restore graph node expansions from shared state */
     function restoreGraphExpansions() {
       let changed = true;
       while (changed) {
@@ -3424,20 +3288,12 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
               const nid = item.nodeId;
               if (nodeMap[nid]) continue;
               const newNode = {
-                id: nid,
-                label: item.label,
-                kind: item.kind || '',
-                isDeclaration: !!item.isDeclaration,
-                noChildren: false,
+                id: nid, label: item.label, kind: item.kind || '',
+                isDeclaration: !!item.isDeclaration, noChildren: false,
                 x: 0, y: 0, w: 0, h: G_NODE_H,
-                children: [],
-                expanded: false,
-                loading: false,
-                data: item,
-                parentId: n.id,
-                callSites: mg.callSites,
-                _callBadgeRects: [],
-                _toggleRect: null,
+                children: [], expanded: false, loading: false,
+                data: item, parentId: n.id, callSites: mg.callSites,
+                _callBadgeRects: [], _toggleRect: null,
               };
               gNodes.push(newNode);
               nodeMap[newNode.id] = newNode;
@@ -3463,11 +3319,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
         toggleEl.innerHTML = isVisible
           ? '<svg viewBox="0 0 16 16"><polyline points="6,2 12,8 6,14"/></svg>'
           : '<svg viewBox="0 0 16 16"><polyline points="2,6 8,12 14,6"/></svg>';
-        if (isVisible) {
-          expandedNodeIds.delete(nodeId);
-        } else {
-          expandedNodeIds.add(nodeId);
-        }
+        if (isVisible) { expandedNodeIds.delete(nodeId); } else { expandedNodeIds.add(nodeId); }
       } else {
         toggleEl.innerHTML = '<svg viewBox="0 0 16 16"><polyline points="6,2 12,8 6,14"/></svg>';
         toggleEl.classList.add('loading');
@@ -3479,9 +3331,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       if (!hit || !graphNodeCanToggle(hit)) { return true; }
       if (hit.expanded) {
         graphAnimateCollapse(hit, () => {
-          graphRelayoutKeepView(hit.id, () => {
-            graphCollapse(hit);
-          });
+          graphRelayoutKeepView(hit.id, () => { graphCollapse(hit); });
           graphDraw();
         });
         return true;
@@ -3490,9 +3340,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       if (nodeChildrenCache.has(hit.id)) {
         const cached = nodeChildrenCache.get(hit.id);
         graphHandleChildren(hit.id, cached);
-        if (cached && cached.length > 0) {
-          expandedNodeIds.add(hit.id);
-        }
+        if (cached && cached.length > 0) { expandedNodeIds.add(hit.id); }
         loadedNodes.add(hit.id);
         return true;
       }
@@ -3503,7 +3351,6 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       return true;
     }
 
-    // ── Click handlers (tree view) ───────────────────────────────────────
     content.addEventListener('click', (e) => {
       const toggle = e.target.closest('.tree-toggle');
       if (toggle) {
@@ -3546,12 +3393,9 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
         relativePath: fileEl ? fileEl.textContent.trim() : '',
         uri: treeRow.dataset.uri,
       }, e.clientX, e.clientY);
-      if (nodeEl) {
-        setSelectedTreeNode(nodeEl.dataset.nodeId || '');
-      }
+      if (nodeEl) { setSelectedTreeNode(nodeEl.dataset.nodeId || ''); }
     });
 
-    // Double-click on tree row: open in editor AND update peek view
     content.addEventListener('dblclick', (e) => {
       const treeRow = e.target.closest('.tree-row');
       if (treeRow && !e.target.closest('.tree-toggle') && !e.target.closest('.col-splitter')) {
@@ -3565,20 +3409,16 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       }
     });
 
-    // ══════════════════════════════════════════════════════════════════════
-    // ── Graph View (Canvas-based) ────────────────────────────────────────
-    // ══════════════════════════════════════════════════════════════════════
-
     const ctx = graphCanvas.getContext('2d');
-    let gNodes = [];   // {id, label, kind, x, y, w, h, children:[], expanded, loading, data, parentId, callSites:[], _callBadgeRects:[], _toggleRect}
-    let gEdges = [];   // {from, to}
+    let gNodes = [];
+    let gEdges = [];
     let gPan = {x: 0, y: 0};
     let gZoom = 1;
     let gDragging = false;
     let gDragStart = {x: 0, y: 0};
     let gHover = null;
-    let gHoverCallSite = -1;  // index of hovered call-site badge (-1 = none)
-    let gPendingExpand = null; // nodeId waiting for children
+    let gHoverCallSite = -1;
+    let gPendingExpand = null;
     let gAnimFrame = null;
     let gLayoutAnimFrame = null;
     let gCollapseAnimFrame = null;
@@ -3593,14 +3433,12 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     function postSingleClickNavigation(uri, line, character) {
       vscodeApi.postMessage({
         type: singleClickAction === 'jumpTo' ? 'jumpTo' : 'peekOnly',
-        uri,
-        line,
-        character,
+        uri, line, character,
       });
     }
 
     const G_NODE_H = 24;
-    const G_CALL_ROW_H = 14;  // extra height per call-site badge row
+    const G_CALL_ROW_H = 14;
     const G_CALLS_PER_ROW = 5;
     const G_NODE_PAD_L = 6;
     const G_NODE_PAD_R = 8;
@@ -3618,15 +3456,10 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     const G_LAYOUT_ANIM_MS = 180;
     const G_COLLAPSE_ANIM_MS = 160;
 
-    /**
-     * Merge tree-node items that refer to the same enclosing symbol into a
-     * single entry with multiple call-sites.  Returns an array of
-     * { primary: TreeNodeData, callSites: [{callLine, callCharacter, uri}] }.
-     */
     function mergeItemsBySymbol(items) {
       if (!items || items.length === 0) return [];
-      const groups = new Map(); // key -> { items[], expandableItem }
-      const order = [];         // preserve first-seen order of keys
+      const groups = new Map();
+      const order = [];
       for (const item of items) {
         const key = item.uri + '#' + item.line + ':' + item.character;
         if (!groups.has(key)) {
@@ -3653,21 +3486,14 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     }
 
     function graphBuildFromData(d) {
-      if (gCollapseAnimFrame) {
-        cancelAnimationFrame(gCollapseAnimFrame);
-        gCollapseAnimFrame = null;
-      }
-      if (gLayoutAnimFrame) {
-        cancelAnimationFrame(gLayoutAnimFrame);
-        gLayoutAnimFrame = null;
-      }
+      if (gCollapseAnimFrame) { cancelAnimationFrame(gCollapseAnimFrame); gCollapseAnimFrame = null; }
+      if (gLayoutAnimFrame) { cancelAnimationFrame(gLayoutAnimFrame); gLayoutAnimFrame = null; }
       gNodes = [];
       gEdges = [];
       gPan = {x: 0, y: 0};
       gZoom = 1;
       gPendingExpand = null;
 
-      // Root node (the queried symbol)
       const rootId = d.rootNode?.nodeId || '__root__';
       gNodes.push({
         id: rootId,
@@ -3676,36 +3502,22 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
         isDeclaration: !!d.rootNode?.isDeclaration,
         noChildren: false,
         x: 0, y: 0, w: 0, h: G_NODE_H,
-        children: [],
-        expanded: true,
-        loading: false,
-        data: d.rootNode || null,
-        parentId: null,
-        callSites: null,
-        _callBadgeRects: [],
-        _toggleRect: null,
+        children: [], expanded: true, loading: false,
+        data: d.rootNode || null, parentId: null,
+        callSites: null, _callBadgeRects: [], _toggleRect: null,
       });
 
-      // Combine refNodes as first-level children (merge duplicates)
       const merged = mergeItemsBySymbol(d.refNodes || []);
       for (const mg of merged) {
         const item = mg.primary;
         const nid = item.nodeId;
         gNodes.push({
-          id: nid,
-          label: item.label,
-          kind: item.kind || '',
-          isDeclaration: !!item.isDeclaration,
-          noChildren: false,
+          id: nid, label: item.label, kind: item.kind || '',
+          isDeclaration: !!item.isDeclaration, noChildren: false,
           x: 0, y: 0, w: 0, h: G_NODE_H,
-          children: [],
-          expanded: false,
-          loading: false,
-          data: item,
-          parentId: rootId,
-          callSites: mg.callSites,
-          _callBadgeRects: [],
-          _toggleRect: null,
+          children: [], expanded: false, loading: false,
+          data: item, parentId: rootId, callSites: mg.callSites,
+          _callBadgeRects: [], _toggleRect: null,
         });
         gNodes[0].children.push(nid);
         gEdges.push({ from: rootId, to: nid });
@@ -3715,13 +3527,11 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       graphDraw();
     }
 
-    /* Measure text width */
     function gTextWidth(text, font) {
       ctx.font = font;
       return ctx.measureText(text).width;
     }
 
-    /* Return icon-like symbol for a kind */
     ${buildKindIconFunction('nodeKindIcon')}
 
     function graphNodeCanToggle(node) {
@@ -3731,22 +3541,17 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       return !String(node.data.nodeId).startsWith('leaf_');
     }
 
-    /* Return symbol for a kind (used in tree view) */
-    function kindSymbol(kind) {
-      return nodeKindIcon(kind);
-    }
+    function kindSymbol(kind) { return nodeKindIcon(kind); }
 
     function isDeclarationNode(node) {
       if (!node || !node.isDeclaration) return false;
       return node.kind === 'Function' || node.kind === 'Method' || node.kind === 'Constructor';
     }
 
-    /* Parse common CSS color formats into numeric RGBA */
     function parseCssColor(colorText) {
       const t = (colorText || '').trim();
       if (!t) return null;
 
-      // #RGB / #RGBA / #RRGGBB / #RRGGBBAA
       if (t[0] === '#') {
         const h = t.slice(1);
         if (h.length === 3 || h.length === 4) {
@@ -3767,7 +3572,6 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
         }
       }
 
-      // rgb(...) / rgba(...)
       const m = t.match(/^rgba?\(([^)]+)\)$/i);
       if (m) {
         const parts = m[1].split(',').map(p => p.trim());
@@ -3837,19 +3641,16 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       return Math.max(0.05, Math.min(5, n));
     }
 
-    /* Return semi-transparent background color for a kind badge */
     function kindBgColor(kind) {
       const color = nodeKindColor(kind);
       return color ? colorToRgba(color, 0.18) : 'rgba(128,128,128,0.18)';
     }
 
-    /* Return accent color for a kind — reads CSS vars injected from real TextMate theme */
     function nodeKindColor(kind) {
       const v = getComputedStyle(document.documentElement).getPropertyValue('--peek-kind-' + kind).trim();
       return v || null;
     }
 
-    /* Tree layout: parent centered on the geometric center of its expanded subtree */
     function graphLayout() {
       const dpr = window.devicePixelRatio || 1;
       const cw = graphContainer.clientWidth;
@@ -3861,7 +3662,6 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
 
       const fontSize = 12;
       const font = fontSize + 'px ' + getComputedStyle(document.body).fontFamily;
-
       const callFont = '10px ' + getComputedStyle(document.body).fontFamily;
       const nodeMap = {};
       for (const n of gNodes) {
@@ -3877,9 +3677,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
         const memberW = gTextWidth(memberText, isRootNode ? ('bold ' + font) : font);
         const labelW = useTwoLineLabel ? Math.max(ownerW + sepW, memberW) : (ownerW + sepW + memberW);
         let baseW = G_NODE_PAD_L + G_NODE_PAD_R + G_KIND_BADGE_W + G_KIND_BADGE_GAP + labelW;
-        if (isDeclarationNode(n)) {
-          baseW += G_DECL_RIGHT_EXTRA;
-        }
+        if (isDeclarationNode(n)) { baseW += G_DECL_RIGHT_EXTRA; }
 
         const twoLineHeaderH = useTwoLineLabel ? Math.max(G_NODE_H, fontSize * 2 + G_PAD_Y * 2 + 2) : G_NODE_H;
         n._labelTwoLine = useTwoLineLabel;
@@ -3910,9 +3708,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
         n.w = Math.max(baseW, 60);
       }
 
-      if (gNodes.length === 0) {
-        return;
-      }
+      if (gNodes.length === 0) { return; }
 
       const rootNode = nodeMap['__root__'] || gNodes.find(n => n.parentId == null) || gNodes[0];
       const rootId = rootNode.id;
@@ -3921,15 +3717,12 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
         const a = nodeMap[aId];
         const b = nodeMap[bId];
         if (!a || !b) return String(aId).localeCompare(String(bId));
-
         const lineA = a.data?.callLine ?? a.data?.line ?? -1;
         const lineB = b.data?.callLine ?? b.data?.line ?? -1;
         if (lineA !== lineB) return lineA - lineB;
-
         const charA = a.data?.callCharacter ?? a.data?.character ?? -1;
         const charB = b.data?.callCharacter ?? b.data?.character ?? -1;
         if (charA !== charB) return charA - charB;
-
         return String(a.label || '').localeCompare(String(b.label || ''));
       };
 
@@ -3957,16 +3750,12 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       }
 
       for (const n of gNodes) {
-        if (levels[n.id] === undefined) {
-          levels[n.id] = 0;
-        }
+        if (levels[n.id] === undefined) { levels[n.id] = 0; }
       }
 
       let maxLevel = 0;
       for (const n of gNodes) {
-        if (levels[n.id] > maxLevel) {
-          maxLevel = levels[n.id];
-        }
+        if (levels[n.id] > maxLevel) { maxLevel = levels[n.id]; }
       }
 
       const levelMaxW = {};
@@ -4009,16 +3798,10 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       const spanCache = new Map();
       const calcSubtreeSpan = (nodeId, horizontalGrowth, visiting = new Set()) => {
         const cached = spanCache.get(nodeId);
-        if (cached && cached.axis === horizontalGrowth) {
-          return cached.span;
-        }
-
+        if (cached && cached.axis === horizontalGrowth) { return cached.span; }
         const node = nodeMap[nodeId];
         if (!node) return 0;
-        if (visiting.has(nodeId)) {
-          return horizontalGrowth ? node.h : node.w;
-        }
-
+        if (visiting.has(nodeId)) { return horizontalGrowth ? node.h : node.w; }
         visiting.add(nodeId);
         const ownSpan = horizontalGrowth ? node.h : node.w;
         const childIds = childIdsOf(node).filter(cid => levels[cid] === (levels[nodeId] + 1));
@@ -4031,7 +3814,6 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
           }
         }
         visiting.delete(nodeId);
-
         const span = Math.max(ownSpan, childrenSpan || 0);
         spanCache.set(nodeId, { axis: horizontalGrowth, span });
         return span;
@@ -4042,7 +3824,6 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
         const placeVertical = (nodeId, topY) => {
           const node = nodeMap[nodeId];
           if (!node) return;
-
           const lv = levels[nodeId] ?? 0;
           const subtreeSpan = calcSubtreeSpan(nodeId, true);
           const nodeCenterY = topY + subtreeSpan / 2;
@@ -4069,14 +3850,12 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
             childTop += childSpans[i] + G_SIBLING_GAP_Y;
           }
         };
-
         placeVertical(rootId, 40);
       } else {
         spanCache.clear();
         const placeHorizontal = (nodeId, leftX) => {
           const node = nodeMap[nodeId];
           if (!node) return;
-
           const lv = levels[nodeId] ?? 0;
           const subtreeSpan = calcSubtreeSpan(nodeId, false);
           const nodeCenterX = leftX + subtreeSpan / 2;
@@ -4103,11 +3882,9 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
             childLeft += childSpans[i] + G_SIBLING_GAP_X;
           }
         };
-
         placeHorizontal(rootId, 40);
       }
 
-      // Center the graph horizontally
       if (gNodes.length > 0) {
         let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
         for (const n of gNodes) {
@@ -4141,10 +3918,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
         if (before) {
           const ax = before.x + before.w / 2;
           const ay = before.y + before.h / 2;
-          anchorScreen = {
-            x: prevPan.x + ax * prevZoom,
-            y: prevPan.y + ay * prevZoom,
-          };
+          anchorScreen = { x: prevPan.x + ax * prevZoom, y: prevPan.y + ay * prevZoom };
         }
       }
 
@@ -4174,14 +3948,8 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     }
 
     function graphAnimateLayoutTransition(prevNodeState, prevPan, targetPan, anchorNodeId, durationMs) {
-      if (gCollapseAnimFrame) {
-        cancelAnimationFrame(gCollapseAnimFrame);
-        gCollapseAnimFrame = null;
-      }
-      if (gLayoutAnimFrame) {
-        cancelAnimationFrame(gLayoutAnimFrame);
-        gLayoutAnimFrame = null;
-      }
+      if (gCollapseAnimFrame) { cancelAnimationFrame(gCollapseAnimFrame); gCollapseAnimFrame = null; }
+      if (gLayoutAnimFrame) { cancelAnimationFrame(gLayoutAnimFrame); gLayoutAnimFrame = null; }
 
       const targetNodeState = new Map();
       for (const n of gNodes) {
@@ -4189,9 +3957,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       }
 
       const clearNodeAnimationOpacity = () => {
-        for (const n of gNodes) {
-          n._animOpacity = null;
-        }
+        for (const n of gNodes) { n._animOpacity = null; }
       };
 
       const startNodeState = new Map();
@@ -4202,8 +3968,6 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
           ?? anchorStart
           ?? targetNodeState.get(n.id);
         startNodeState.set(n.id, from);
-
-        // Initialize node positions to start-state for smooth interpolation.
         n.x = from.x;
         n.y = from.y;
         n.w = from.w;
@@ -4280,25 +4044,12 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     }
 
     function graphAnimateCollapse(node, onDone) {
-      if (!node) {
-        onDone();
-        return;
-      }
-
+      if (!node) { onDone(); return; }
       const toRemove = graphCollectDescendantIds(node);
-      if (toRemove.size === 0) {
-        onDone();
-        return;
-      }
+      if (toRemove.size === 0) { onDone(); return; }
 
-      if (gLayoutAnimFrame) {
-        cancelAnimationFrame(gLayoutAnimFrame);
-        gLayoutAnimFrame = null;
-      }
-      if (gCollapseAnimFrame) {
-        cancelAnimationFrame(gCollapseAnimFrame);
-        gCollapseAnimFrame = null;
-      }
+      if (gLayoutAnimFrame) { cancelAnimationFrame(gLayoutAnimFrame); gLayoutAnimFrame = null; }
+      if (gCollapseAnimFrame) { cancelAnimationFrame(gCollapseAnimFrame); gCollapseAnimFrame = null; }
 
       const startState = new Map();
       for (const n of gNodes) {
@@ -4339,9 +4090,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
           gCollapseAnimFrame = requestAnimationFrame(tick);
         } else {
           for (const n of gNodes) {
-            if (toRemove.has(n.id)) {
-              n._animOpacity = null;
-            }
+            if (toRemove.has(n.id)) { n._animOpacity = null; }
           }
           gCollapseAnimFrame = null;
           onDone();
@@ -4351,7 +4100,6 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       gCollapseAnimFrame = requestAnimationFrame(tick);
     }
 
-    /* Draw */
     function graphDraw() {
       const dpr = window.devicePixelRatio || 1;
       const cw = graphCanvas.width / dpr;
@@ -4376,7 +4124,6 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       const edgeColor = ensureReadableColor(dimBase, canvasBg, fg, 2.2);
       const dimColor = ensureReadableColor(dimBase, nodeBg, fg, 2.2);
 
-      // Draw edges
       for (const e of gEdges) {
         const from = nodeMap[e.from];
         const to = nodeMap[e.to];
@@ -4413,7 +4160,6 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
         ctx.bezierCurveTo(cp1x, cp1y, cp2x, cp2y, x2, y2);
         ctx.stroke();
 
-        // Arrow head
         const arrowSize = 4;
         let finalAngle = 0;
         if (graphDirection === 'up') {
@@ -4432,20 +4178,16 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
         ctx.restore();
       }
 
-      // Draw nodes
       const fontSize = 12;
       const font = fontSize + 'px ' + getComputedStyle(document.body).fontFamily;
       for (const n of gNodes) {
         const isHover = gHover === n.id;
         n._toggleRect = null;
         const nodeOpacity = n._animOpacity != null ? Math.max(0, Math.min(1, n._animOpacity)) : 1;
-        if (nodeOpacity <= 0.01) {
-          continue;
-        }
+        if (nodeOpacity <= 0.01) { continue; }
         ctx.save();
         ctx.globalAlpha = nodeOpacity;
 
-        // Node shape: function declaration nodes use right trapezoid; others use rounded rectangle
         const rawKindColor = nodeKindColor(n.kind) || funcColor;
         const kindBorderColor = ensureReadableColor(rawKindColor, nodeBg, fg, 2.4);
         const nodeFill = isHover ? hoverBg : nodeBg;
@@ -4483,7 +4225,6 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
         ctx.fill();
         ctx.stroke();
 
-        // Loading indicator
         if (n.loading) {
           ctx.strokeStyle = accentColor;
           ctx.lineWidth = 2;
@@ -4508,7 +4249,6 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
           }
         }
 
-        // Kind badge + label (supports two-line qualified names in vertical mode)
         const hasMultiCS = n.callSites && n.callSites.length > 1;
         const headerH = n._headerH || G_NODE_H;
         const labelCenterY = n.y + headerH / 2;
@@ -4533,14 +4273,12 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
           ? (n.x + n.w - G_NODE_PAD_R - totalContentW)
           : (n.x + G_NODE_PAD_L);
 
-        // Badge symbol
         ctx.font = '600 9px ' + getComputedStyle(document.body).fontFamily;
         ctx.fillStyle = kindBorderColor;
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
         ctx.fillText(letter, startX + badgeW / 2, labelCenterY);
 
-        // Label text
         ctx.font = drawFont;
         const ownerRawColor = cssVar(styles, '--peek-qualified-owner', cssVar(styles, '--peek-kind-Class', fg));
         const sepRawColor = cssVar(styles, '--peek-operator', fg);
@@ -4575,7 +4313,6 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
           ctx.fillText(memberText, textX, labelCenterY);
         }
 
-        // Expand/collapse toggle icon (on node extension side)
         if (graphNodeCanToggle(n) || n.noChildren) {
           const toggleSize = 12;
           const toggleGap = 4;
@@ -4633,7 +4370,6 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
           }
         }
 
-        // ── Call-site line-number badges (only for merged nodes) ──────────
         n._callBadgeRects = [];
         const cs = n.callSites;
         if (cs && cs.length > 1) {
@@ -4653,17 +4389,14 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
               const rowIndex = Math.floor(si / G_CALLS_PER_ROW);
               const by = badgeRowY + rowIndex * G_CALL_ROW_H + (G_CALL_ROW_H - bh) / 2;
 
-              // Highlight hovered badge
               const isHot = (gHover === n.id && gHoverCallSite === si);
 
-              // Badge background
               ctx.fillStyle = isHot ? colorToRgba(accentColor, 0.35) : colorToRgba(dimColor, 0.18);
               const badgeX = graphDirection === 'left' ? (bx - bw) : bx;
               ctx.beginPath();
               ctx.roundRect(badgeX, by, bw, bh, 2);
               ctx.fill();
 
-              // Badge text
               ctx.fillStyle = isHot
                 ? ensureReadableColor(accentColor, nodeFill, fg, 3.0)
                 : ensureReadableColor(dimColor, nodeFill, fg, 3.0);
@@ -4689,7 +4422,6 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       ctx.restore();
     }
 
-    /* Hit-test: which node is under canvas coords? */
     function graphHitTest(cx, cy) {
       const wx = (cx - gPan.x) / gZoom;
       const wy = (cy - gPan.y) / gZoom;
@@ -4707,7 +4439,6 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       return null;
     }
 
-    /* Hit-test call-site badge inside a node; returns badge index or -1 */
     function graphHitTestCallSite(node, cx, cy) {
       if (!node || !node._callBadgeRects || node._callBadgeRects.length === 0) return -1;
       const wx = (cx - gPan.x) / gZoom;
@@ -4728,7 +4459,6 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       return wx >= r.x && wx <= r.x + r.w && wy >= r.y && wy <= r.y + r.h;
     }
 
-    /* Handle children arriving from extension (graph mode) */
     function graphHandleChildren(parentNodeId, items) {
       const nodeMap = {};
       for (const n of gNodes) nodeMap[n.id] = n;
@@ -4751,34 +4481,23 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
         for (const mg of merged) {
           const item = mg.primary;
           const nid = item.nodeId;
-          if (nodeMap[nid]) continue; // avoid duplicates
+          if (nodeMap[nid]) continue;
           gNodes.push({
-            id: nid,
-            label: item.label,
-            kind: item.kind || '',
-            isDeclaration: !!item.isDeclaration,
-            noChildren: false,
+            id: nid, label: item.label, kind: item.kind || '',
+            isDeclaration: !!item.isDeclaration, noChildren: false,
             x: 0, y: 0, w: 0, h: G_NODE_H,
-            children: [],
-            expanded: false,
-            loading: false,
-            data: item,
-            parentId: parentNodeId,
-            callSites: mg.callSites,
-            _callBadgeRects: [],
-            _toggleRect: null,
+            children: [], expanded: false, loading: false,
+            data: item, parentId: parentNodeId, callSites: mg.callSites,
+            _callBadgeRects: [], _toggleRect: null,
           });
           parent.children.push(nid);
           gEdges.push({ from: parentNodeId, to: nid });
         }
-
-        // Restore previously expanded descendants (if parent was collapsed earlier).
         restoreGraphExpansions();
       });
       graphDraw();
     }
 
-    /* Collapse a node: remove all descendants */
     function graphCollapse(node) {
       const nodeMap = {};
       for (const n of gNodes) nodeMap[n.id] = n;
@@ -4796,12 +4515,8 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       gEdges = gEdges.filter(e => !toRemove.has(e.from) && !toRemove.has(e.to));
       node.children = [];
       node.expanded = false;
-      // Keep descendant expansion state so re-expanding this node can restore
-      // previously opened descendants from cache.
       expandedNodeIds.delete(node.id);
     }
-
-    // ── Canvas interactions ──────────────────────────────────────────────
 
     graphCanvas.addEventListener('mousemove', (e) => {
       const rect = graphCanvas.getBoundingClientRect();
@@ -4855,7 +4570,6 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
         const cy = e.clientY - rect.top;
         const factor = e.deltaY < 0 ? 1.1 : 0.9;
         const newZoom = Math.max(0.2, Math.min(5, gZoom * factor));
-        // Zoom towards cursor
         gPan.x = cx - (cx - gPan.x) * (newZoom / gZoom);
         gPan.y = cy - (cy - gPan.y) * (newZoom / gZoom);
         gZoom = newZoom;
@@ -4890,7 +4604,6 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       showSplitContextMenu(e.clientX, e.clientY);
     });
 
-    // Click: peek in context window (single), open in editor (double), expand/collapse (+/- icon)
     graphCanvas.addEventListener('click', (e) => {
       const rect = graphCanvas.getBoundingClientRect();
       const cx = e.clientX - rect.left;
@@ -4898,17 +4611,9 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       const hit = graphHitTest(cx, cy);
       if (!hit) return;
 
-      if (e.ctrlKey) {
-        toggleGraphNode(hit);
-        return;
-      }
+      if (e.ctrlKey) { toggleGraphNode(hit); return; }
+      if (graphHitTestToggle(hit, cx, cy)) { toggleGraphNode(hit); return; }
 
-      if (graphHitTestToggle(hit, cx, cy)) {
-        toggleGraphNode(hit);
-        return;
-      }
-
-      // Single click: update peek view only (do NOT open editor)
       if (e.detail === 1 && hit.data) {
         const csIdx = graphHitTestCallSite(hit, cx, cy);
         const cs = hit.callSites;
@@ -4919,7 +4624,6 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       }
     });
 
-    // Double-click: open in editor
     graphCanvas.addEventListener('dblclick', (e) => {
       const rect = graphCanvas.getBoundingClientRect();
       const cx = e.clientX - rect.left;
@@ -4935,7 +4639,6 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       vscodeApi.postMessage({ type: 'jumpTo', uri: cu, line: cl, character: cc });
     });
 
-    // Resize observer for canvas
     const resizeObs = new ResizeObserver(() => {
       if (isGraphMode(viewMode) && lastUpdateData) {
         graphLayout();
@@ -4945,21 +4648,12 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     resizeObs.observe(graphContainer);
 
     return {
-      paneId,
-      paneRoot,
-      hasInstance(instanceId) {
-        return instanceStateMap.has(instanceId);
-      },
-      getInstanceIds() {
-        return [...instanceOrder];
-      },
-      getTransferPayload(instanceId, options) {
-        return buildTransferPayload(instanceId, options);
-      },
+      paneId, paneRoot,
+      hasInstance(instanceId) { return instanceStateMap.has(instanceId); },
+      getInstanceIds() { return [...instanceOrder]; },
+      getTransferPayload(instanceId, options) { return buildTransferPayload(instanceId, options); },
       importTransferredInstance,
-      removeInstance(instanceId, options) {
-        removeInstanceInternal(instanceId, options);
-      },
+      removeInstance(instanceId, options) { removeInstanceInternal(instanceId, options); },
       closeAllInstances,
       handleMessage,
     };
@@ -4985,31 +4679,17 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       return controller;
     }
 
-    function hideSplitContextMenu() {
-      splitContextMenu.hidden = true;
-    }
+    function hideSplitContextMenu() { splitContextMenu.hidden = true; }
 
     function showSplitContextMenu(clientX, clientY) {
       const multiPane = paneControllers.size > 1;
       const horizontal = currentSplitMode === 'horizontal';
-      if (splitHorizontalMenuItem) {
-        splitHorizontalMenuItem.style.display = multiPane ? 'none' : '';
-      }
-      if (splitVerticalMenuItem) {
-        splitVerticalMenuItem.style.display = multiPane ? 'none' : '';
-      }
-      if (switchHorizontalMenuItem) {
-        switchHorizontalMenuItem.style.display = multiPane && !horizontal ? '' : 'none';
-      }
-      if (switchVerticalMenuItem) {
-        switchVerticalMenuItem.style.display = multiPane && horizontal ? '' : 'none';
-      }
-      if (swapPanesMenuItem) {
-        swapPanesMenuItem.style.display = multiPane ? '' : 'none';
-      }
-      if (restoreSingleMenuItem) {
-        restoreSingleMenuItem.style.display = multiPane ? '' : 'none';
-      }
+      if (splitHorizontalMenuItem) { splitHorizontalMenuItem.style.display = multiPane ? 'none' : ''; }
+      if (splitVerticalMenuItem) { splitVerticalMenuItem.style.display = multiPane ? 'none' : ''; }
+      if (switchHorizontalMenuItem) { switchHorizontalMenuItem.style.display = multiPane && !horizontal ? '' : 'none'; }
+      if (switchVerticalMenuItem) { switchVerticalMenuItem.style.display = multiPane && horizontal ? '' : 'none'; }
+      if (swapPanesMenuItem) { swapPanesMenuItem.style.display = multiPane ? '' : 'none'; }
+      if (restoreSingleMenuItem) { restoreSingleMenuItem.style.display = multiPane ? '' : 'none'; }
       splitContextMenu.hidden = false;
       splitContextMenu.style.left = clientX + 'px';
       splitContextMenu.style.top = clientY + 'px';
@@ -5027,13 +4707,9 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
 
     function getOtherPaneController(sourcePaneId, options) {
       const opts = options || {};
-      if (opts.ensurePane) {
-        ensureSecondPane();
-      }
+      if (opts.ensurePane) { ensureSecondPane(); }
       for (const pane of paneControllers.values()) {
-        if (pane.paneId !== sourcePaneId) {
-          return pane;
-        }
+        if (pane.paneId !== sourcePaneId) { return pane; }
       }
       return null;
     }
@@ -5044,22 +4720,15 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
       const wasSinglePane = paneControllers.size <= 1;
       const targetPane = getOtherPaneController(sourcePaneId, { ensurePane: true });
       if (!targetPane) { return; }
-      if (wasSinglePane) {
-        setSplitMode('vertical');
-      }
+      if (wasSinglePane) { setSplitMode('vertical'); }
 
       const payload = sourcePane.getTransferPayload(instanceId, { preserveInstanceId: isMove });
       if (!payload) { return; }
-      if (!isMove) {
-        payload.title = payload.title + ' Copy';
-      }
+      if (!isMove) { payload.title = payload.title + ' Copy'; }
       targetPane.importTransferredInstance(payload);
 
       if (isMove) {
-        sourcePane.removeInstance(instanceId, {
-          force: true,
-          skipCloseMessage: true,
-        });
+        sourcePane.removeInstance(instanceId, { force: true, skipCloseMessage: true });
       }
     }
 
@@ -5082,10 +4751,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     }
 
     function restoreSinglePane() {
-      if (paneControllers.size <= 1) {
-        setSplitMode('single');
-        return;
-      }
+      if (paneControllers.size <= 1) { setSplitMode('single'); return; }
       const panes = [...paneControllers.values()];
       const keeper = panes[0];
       for (let i = 1; i < panes.length; i += 1) {
@@ -5093,9 +4759,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
         const ids = pane.getInstanceIds();
         for (const id of ids) {
           const payload = pane.getTransferPayload(id, { preserveInstanceId: true });
-          if (payload) {
-            keeper.importTransferredInstance(payload);
-          }
+          if (payload) { keeper.importTransferredInstance(payload); }
         }
         pane.paneRoot.remove();
         paneControllers.delete(pane.paneId);

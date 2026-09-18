@@ -34,21 +34,32 @@ export class SymbolIndexer {
   }
 
   async indexWorkspace(
-    onProgress?: (done: number, total: number, currentFile: string) => void
+    onProgress?: (done: number, total: number, currentFile: string) => void,
+    isStale?: () => boolean
   ): Promise<void> {
+    if (isStale?.()) { return; }
+
     const files = await vscode.workspace.findFiles(
       '**/*.{c,h,cpp,hpp,cc,cxx,hxx}',
       this._getCppExcludeGlob()
     );
+    if (isStale?.()) { return; }
+
     const total = files.length;
     let done = 0;
     const concurrency = 6;
 
     for (let i = 0; i < files.length; i += concurrency) {
+      // 每批开始前检查一次
+      if (isStale?.()) { return; }
+
       const batch = files.slice(i, i + concurrency);
       await Promise.all(batch.map(async (file) => {
+        // 批内每个文件也检查一次（并发执行时尽快退出）
+        if (isStale?.()) { return; }
         await this.indexFile(file);
         done++;
+        if (isStale?.()) { return; }
         onProgress?.(done, total, file.fsPath);
       }));
     }
@@ -97,12 +108,16 @@ export class SymbolIndexer {
 
   async indexChangedFiles(
     since: number,
-    onProgress?: (done: number, total: number, currentFile: string) => void
+    onProgress?: (done: number, total: number, currentFile: string) => void,
+    isStale?: () => boolean
   ): Promise<number> {
+    if (isStale?.()) { return 0; }
+
     const files = await vscode.workspace.findFiles(
       '**/*.{c,h,cpp,hpp,cc,cxx,hxx}',
       this._getCppExcludeGlob()
     );
+    if (isStale?.()) { return 0; }
 
     // 当前工作区里存在的文件路径集合
     const existingPaths = new Set<string>();
@@ -113,6 +128,7 @@ export class SymbolIndexer {
     // 清理已删除文件的索引
     const indexedPaths = this.db.getAllFilePaths();
     for (const indexedPath of indexedPaths) {
+      if (isStale?.()) { return 0; }
       if (!existingPaths.has(indexedPath)) {
         this.db.deleteFile(indexedPath);
         this.db.clearWordIndexForFile(indexedPath);
@@ -123,6 +139,7 @@ export class SymbolIndexer {
     const sinceWithBuffer = since - 2000;
     const changedFiles: vscode.Uri[] = [];
     for (const file of files) {
+      if (isStale?.()) { return 0; }
       try {
         const stat = await vscode.workspace.fs.stat(file);
         if (stat.mtime > sinceWithBuffer) {
@@ -135,8 +152,10 @@ export class SymbolIndexer {
     const total = changedFiles.length;
     let done = 0;
     for (const file of changedFiles) {
+      if (isStale?.()) { return done; }
       await this.indexFile(file);
       done++;
+      if (isStale?.()) { return done; }
       onProgress?.(done, total, file.fsPath);
     }
     return total;
@@ -148,8 +167,11 @@ export class SymbolIndexer {
   async buildWordIndex(
     rgPath: string,
     wsRoot: string,
-    onProgress?: (done: number, total: number, currentFile: string) => void
+    onProgress?: (done: number, total: number, currentFile: string) => void,
+    isStale?: () => boolean
   ): Promise<void> {
+    if (isStale?.()) { return; }
+
     const excludePatterns = this._getCppExcludePatterns();
     const args = [
       '--json',
@@ -169,11 +191,16 @@ export class SymbolIndexer {
       stdout = e?.stdout || '';
     }
 
+    if (isStale?.()) { return; }
+
     const lines = stdout.split('\n').filter(Boolean);
     const wordLocations = new Map<string, WordLocation[]>();
     let count = 0;
 
     for (const line of lines) {
+      // 每 200 行检查一次过期，避免频繁调用
+      if (count % 200 === 0 && isStale?.()) { return; }
+
       let match: any;
       try { match = JSON.parse(line); } catch { continue; }
       if (match.type !== 'match') { continue; }
@@ -203,7 +230,11 @@ export class SymbolIndexer {
       }
     }
 
+    // 写入数据库前最后检查一次
+    if (isStale?.()) { return; }
+
     for (const [word, locs] of wordLocations.entries()) {
+      if (isStale?.()) { return; }
       this.db.addWordLocations(word, locs);
     }
     onProgress?.(lines.length, lines.length, '');
