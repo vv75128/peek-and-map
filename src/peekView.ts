@@ -276,16 +276,85 @@ export class PeekViewProvider implements vscode.WebviewViewProvider {
         this._nearestOwnerClassName(best.ancestors) ??
         this._inferCppOwnerClass(best.symbol.name, defDoc.lineAt(best.symbol.selectionRange.start.line).text, defDoc.languageId);
 
+      const symKind = best.symbol.kind;
+      // 对于"有体"的符号（函数/类/结构体/枚举/接口/命名空间等），
+      // focusMode 时定位到符号首行；对于变量/字段/常量等，定位到 pos.line。
+      const isBodyLike =
+        symKind === vscode.SymbolKind.Function ||
+        symKind === vscode.SymbolKind.Method ||
+        symKind === vscode.SymbolKind.Constructor ||
+        symKind === vscode.SymbolKind.Class ||
+        symKind === vscode.SymbolKind.Struct ||
+        symKind === vscode.SymbolKind.Interface ||
+        symKind === vscode.SymbolKind.Enum ||
+        symKind === vscode.SymbolKind.Namespace ||
+        symKind === vscode.SymbolKind.Module ||
+        symKind === vscode.SymbolKind.Object;
+
+      // 函数类符号：若点击位置不在函数签名行，且该行确实是"函数体内"的
+      // 有效代码行（含标识符、非纯注释/空白），则认为是点击了函数体内的
+      // 局部变量/语句。C/C++ 的 LSP 通常不上报局部变量符号，因此这里用
+      // "落在函数体内 + 该行含标识符" 来判定。
+      const isFunctionLike =
+        symKind === vscode.SymbolKind.Function ||
+        symKind === vscode.SymbolKind.Method ||
+        symKind === vscode.SymbolKind.Constructor;
+
+      // 判断该位置是否属于函数体内部（不在函数签名行/不在符号名上）。
+      const insideFunctionBody =
+        isFunctionLike &&
+        pos.line > best.symbol.range.start.line &&
+        pos.line <= best.symbol.range.end.line &&
+        !this._isSymbolNameAt(best.symbol, pos) &&
+        this._lineHasIdentifier(defDoc, pos.line);
+
+      // 决定"光标行"（光标/高亮所在行）
+      // - focusMode + 变量类：pos.line（变量声明所在行）
+      // - focusMode + 函数类 + 点击函数体内有效行：pos.line（局部变量行）
+      // - focusMode + 其他 body-like：符号首行（结构体/枚举/类等）
+      // - 非 focusMode：符号首行（保持原行为）
+      let cursorLine: number;
+      if (focusMode) {
+        if (!isBodyLike) {
+          cursorLine = pos.line;
+        } else if (insideFunctionBody) {
+          cursorLine = pos.line;
+        } else {
+          cursorLine = best.symbol.range.start.line;
+        }
+      } else {
+        cursorLine = best.symbol.range.start.line;
+      }
+
+      // ── typedef struct TAG {...} ALIAS; 特殊处理 ─────────────────────────
+      // 仅在"点击类型别名本身"（非函数体内点击）时启用，
+      // 避免函数体内点击局部变量被误判为 typedef 锚点。
+      let anchorLine = cursorLine;
+      if (focusMode && !insideFunctionBody) {
+        const typedefAnchor = this._findTypedefTagLine(defDoc, best.symbol, pos);
+        if (typedefAnchor !== undefined) {
+          anchorLine = typedefAnchor;
+          cursorLine = typedefAnchor;
+        }
+      }
+
+      // ── 计算显示范围 ──────────────────────────────────────────────────────
+      // focusMode：以符号整体范围为基础，确保上下文完整；
+      //            若符号范围过小（如变量单行），则上下各扩展 padding 行。
+      // 非 focusMode：整个符号范围 + padding（原行为）。
       let range: vscode.Range;
       if (focusMode) {
-        // Map 点击：以变量/函数所在行为中心开一个小窗口
-	    const windowPadding = Math.max(padding, 10);
-	    const winStart = Math.max(best.symbol.range.start.line, pos.line - windowPadding);
-	    const winEnd   = Math.min(best.symbol.range.end.line,   pos.line + windowPadding);
-	    range = new vscode.Range(winStart, 0, winEnd, defDoc.lineAt(winEnd).text.length);
-	  } else {
-	    // 光标移动：保持原来的整个函数范围
-	    range = best.symbol.range;
+        const symStart = best.symbol.range.start.line;
+        const symEnd   = best.symbol.range.end.line;
+        // 保证至少覆盖 anchorLine 附近一个窗口
+        const winStart = Math.max(0, Math.min(symStart, anchorLine - Math.max(padding, 10)));
+        const winEnd   = Math.min(
+          defDoc.lineCount - 1,
+          Math.max(symEnd, anchorLine + Math.max(padding, 10))
+        );
+        range = new vscode.Range(winStart, 0, winEnd, defDoc.lineAt(winEnd).text.length);
+      } else {
+        range = best.symbol.range;
       }
 
       const { code, startLine } = this._expandedText(defDoc, range, focusMode ? 0 : padding);
@@ -293,7 +362,7 @@ export class PeekViewProvider implements vscode.WebviewViewProvider {
         code,
         language: LANG_MAP[defDoc.languageId] ?? 'clike',
         startLine,
-        cursorLine: focusMode ? pos.line : best.symbol.range.start.line,
+        cursorLine,
         symbolName: this._formatSymbolWithOwner(best.symbol.name, ownerClass, best.symbol.kind),
         symbolKind: this._kindName(best.symbol.kind),
         filePath: uri.fsPath,
@@ -323,6 +392,76 @@ export class PeekViewProvider implements vscode.WebviewViewProvider {
       defUri: defUriStr,
       fileName,
     };
+  }
+
+  /**
+   * 判断某一行是否包含至少一个标识符字符（排除纯空白/纯注释行）。
+   * 用于确认"函数体内的有效代码行"，避免把纯 `}`、空行、注释行
+   * 误判为局部变量声明行。
+   */
+  private _lineHasIdentifier(doc: vscode.TextDocument, line: number): boolean {
+    if (line < 0 || line >= doc.lineCount) { return false; }
+    const text = doc.lineAt(line).text;
+    // 去掉行注释后再判断，避免注释里的字符干扰
+    const withoutLineComment = text.replace(/\/\/.*$/, '');
+    for (let i = 0; i < withoutLineComment.length; i++) {
+      if (this._isIdentChar(withoutLineComment.charCodeAt(i))) { return true; }
+    }
+    return false;
+  }
+
+  /**
+   * 判断 pos 是否落在某个符号的 selectionRange 内
+   *（即符号名本身），用于避免把函数名/类型名误判为局部变量。
+   */
+  private _isSymbolNameAt(sym: vscode.DocumentSymbol, pos: vscode.Position): boolean {
+    const sel = sym.selectionRange;
+    if (!sel.contains(pos)) { return false; }
+    // selectionRange 通常覆盖符号名 token；只要 pos 落在其中即视为符号名。
+    return true;
+  }
+
+  private _isIdentChar(code: number): boolean {
+    // 0-9
+    if (code >= 48 && code <= 57) { return true; }
+    // A-Z
+    if (code >= 65 && code <= 90) { return true; }
+    // _
+    if (code === 95) { return true; }
+    // a-z
+    if (code >= 97 && code <= 122) { return true; }
+    // $
+    if (code === 36) { return true; }
+    return false;
+  }
+
+  /**
+   * 检测 `typedef struct TAG {...} ALIAS;` / `typedef enum TAG {...} ALIAS;` 形式。
+   * 当 symbol 是别名（ALIAS），且其 range 起始行包含 `typedef ... TAG`，
+   * 返回 `struct/enum TAG` 所在行号（通常与 typedef 起始行相同）。
+   * 否则返回 undefined。
+   */
+  private _findTypedefTagLine(
+    doc: vscode.TextDocument,
+    symbol: vscode.DocumentSymbol,
+    pos: vscode.Position
+  ): number | undefined {
+    // 只处理包含 pos 的 typedef 别名符号
+    if (!symbol.range.contains(pos)) { return undefined; }
+
+    // 从符号起始行开始，向下扫描若干行，查找 `typedef (struct|enum|union) ... {`
+    const startLine = symbol.range.start.line;
+    const endLine   = Math.min(symbol.range.end.line, startLine + 5);
+    for (let line = startLine; line <= endLine; line++) {
+      const text = doc.lineAt(line).text;
+      // 匹配 typedef struct/enum/union [TAG] ... {
+      const m = text.match(/^\s*typedef\s+(struct|enum|union)\b([^;{]*)\{/);
+      if (m) {
+        // 返回 typedef 起始行（即 struct/enum/union 所在行）
+        return line;
+      }
+    }
+    return undefined;
   }
 
   // ── Private helpers ────────────────────────────────────────────────────────
@@ -487,18 +626,33 @@ export class PeekViewProvider implements vscode.WebviewViewProvider {
     for (const loc of defs) {
       const isLink = 'targetUri' in loc;
       const defUri = isLink ? (loc as vscode.LocationLink).targetUri : (loc as vscode.Location).uri;
-      // Use the start of the declaration when available so Peek lands at the
-      // beginning of the definition block instead of the symbol's selection.
-      const defRange = isLink
-        ? ((loc as vscode.LocationLink).targetSelectionRange ?? (loc as vscode.LocationLink).targetRange)
+
+      // 关键修正：对于局部变量，targetSelectionRange 才是变量名所在范围，
+      // 而 targetRange 可能覆盖整个声明块。优先用 selectionRange。
+      // 但如果 selectionRange 落在行首（character===0），可能不是变量名，
+      // 此时用 targetRange.start 作为回退。
+      const selRange = isLink ? (loc as vscode.LocationLink).targetSelectionRange : undefined;
+      const fullRange = isLink
+        ? (loc as vscode.LocationLink).targetRange
         : (loc as vscode.Location).range;
+      const defRange = selRange ?? fullRange;
       if (!defRange) { continue; }
 
-      const focusPos = isLink && (loc as vscode.LocationLink).targetRange
-        ? (loc as vscode.LocationLink).targetRange.start
-        : defRange.start;
+      // 选择 focusPos：优先 selectionRange.start；
+      // 若其 character 为 0（行首），尝试在该行内右移到第一个标识符位置。
+      let focusPos = defRange.start;
+      if (focusPos.character === 0) {
+        try {
+          const probeDoc = await vscode.workspace.openTextDocument(defUri);
+          const lineText = probeDoc.lineAt(focusPos.line).text;
+          const identCol = this._firstIdentifierColumn(lineText);
+          if (identCol >= 0) {
+            focusPos = new vscode.Position(focusPos.line, identCol);
+          }
+        } catch { /* ignore */ }
+      }
 
-      const key = `${defUri.toString()}|${defRange.start.line}:${defRange.start.character}`;
+      const key = `${defUri.toString()}|${focusPos.line}:${focusPos.character}`;
       if (seen.has(key)) { continue; }
       seen.add(key);
 
@@ -513,6 +667,22 @@ export class PeekViewProvider implements vscode.WebviewViewProvider {
       return null;
     }
     return { contexts, selectedIndex: 0 };
+  }
+
+  /**
+   * 返回一行中第一个标识符字符的列号；若没有标识符字符则返回 -1。
+   * 用于把落在行首（character=0）的 focusPos 修正到实际标识符位置。
+   */
+  private _firstIdentifierColumn(lineText: string): number {
+    // 跳过行首空白
+    let i = 0;
+    while (i < lineText.length && (lineText[i] === ' ' || lineText[i] === '\t')) { i++; }
+    // 跳过常见修饰符/类型关键字前面的指针符号等（尽量找到第一个标识符）
+    // 简化处理：从跳过空白后开始，找第一个标识符字符
+    for (; i < lineText.length; i++) {
+      if (this._isIdentChar(lineText.charCodeAt(i))) { return i; }
+    }
+    return -1;
   }
 
   private _appendCurrentContext(next: ContextInfo): void {
