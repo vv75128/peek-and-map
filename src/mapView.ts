@@ -493,7 +493,13 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
 
     // ★ 走到这里说明确实要做一次引用分析 —— 中断所有正在跑的旧操作。
     //   _abortAllInFlight 里已做 _searchGen++，因此本次搜索令牌取当前值。
-    await this._abortAllInFlight();
+    // 只有在旧搜索还在跑时，才中断它
+    if (this._searchInFlight > 0 || this._activeRgAbort) {
+      await this._abortAllInFlight();
+    } else {
+      // 没有旧搜索，只作废令牌
+      this._searchGen++;
+    }
     const mySearchId = this._searchGen;
 
     // Clear maps for new search
