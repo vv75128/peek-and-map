@@ -1027,7 +1027,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
 
             if (targetFileOnly && uriStr !== targetFileOnly) { continue; }
 
-            if (targetScope) {
+            if (targetScope && !targetDefinition) {
               const sameFile = uriStr === targetScope.uri;
               if (!sameFile) { continue; }
               const inScope = await this._isDefinitionInScope(filePath, lineNum, startCol, targetScope);
@@ -1149,7 +1149,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
           if (inRange.length === 0) { continue; }
           byFile.set(filePath, inRange);
         }
-        if (targetScope && fileUriStr !== targetScope.uri) { continue; }
+        if (targetScope && !targetDefinition && fileUriStr !== targetScope.uri) { continue; }
 
         let doc: vscode.TextDocument;
         try {
@@ -1172,6 +1172,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
         const uriStr = fileUriStr;
 
         for (const loc of locations) {
+
           if (isStale()) { break; }
           const lineNum = loc.line;
           const startCol = loc.char;
@@ -1205,7 +1206,7 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
           }
           if (targetFileOnly && uriStr !== targetFileOnly) { continue; }
 
-          if (targetScope) {
+          if (targetScope && !targetDefinition) {
             const sameFile = uriStr === targetScope.uri;
             if (!sameFile) { continue; }
             const inScope = await this._isDefinitionInScope(filePath, lineNum, startCol, targetScope);
