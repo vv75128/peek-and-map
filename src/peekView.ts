@@ -899,6 +899,11 @@ export class PeekViewProvider implements vscode.WebviewViewProvider {
     const componentsUri = webview.asWebviewUri(vscode.Uri.joinPath(mediaDir, 'components')).toString() + '/';
     const initialThemeCss = getThemeColorsCss();
 
+    // 读取当前文档生效的 editor.tabSize（跟随语言级/工作区级覆盖）
+    const activeDocUri = vscode.window.activeTextEditor?.document.uri;
+    const editorConfig = vscode.workspace.getConfiguration('editor', activeDocUri ?? null);
+    const peekTabSize = editorConfig.get<number>('tabSize', 4);
+
     return /* html */`<!DOCTYPE html>
 <html lang="zh">
 <head>
@@ -910,6 +915,10 @@ export class PeekViewProvider implements vscode.WebviewViewProvider {
                  font-src ${webview.cspSource};" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <style>
+    :root {
+      --peek-tab-size: ${peekTabSize};
+    }
+
     * { box-sizing: border-box; margin: 0; padding: 0; }
 
     body {
@@ -921,6 +930,8 @@ export class PeekViewProvider implements vscode.WebviewViewProvider {
       display: flex;
       flex-direction: column;
       overflow: hidden;
+      tab-size: var(--peek-tab-size, 4);
+      -moz-tab-size: var(--peek-tab-size, 4);
     }
 
     #header {
@@ -1184,6 +1195,8 @@ export class PeekViewProvider implements vscode.WebviewViewProvider {
       font-size: inherit;
       line-height: 1.5;
       vertical-align: top;
+      tab-size: var(--peek-tab-size, 4);
+      -moz-tab-size: var(--peek-tab-size, 4);
     }
 
     tr.cursor-line {
@@ -1203,6 +1216,8 @@ export class PeekViewProvider implements vscode.WebviewViewProvider {
       font-size: inherit;
       text-shadow: none !important;
       color: var(--vscode-editor-foreground, #d4d4d4);
+      tab-size: var(--peek-tab-size, 4);
+      -moz-tab-size: var(--peek-tab-size, 4);
     }
 
     .token { color: var(--vscode-editor-foreground, #d4d4d4); }
