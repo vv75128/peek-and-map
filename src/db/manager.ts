@@ -18,8 +18,8 @@ export class DatabaseManager {
 
   /** 索引 generation：每次新索引自增，作废旧索引。 */
   private _indexGen = 0;
-  /** 是否有索引正在跑（初次索引 / 全量重建 / 增量索引）。 */
-  private _indexing = false;
+  /** 正在跑的索引数量（初次索引 / 全量重建 / 增量索引可能并发）。 */
+  private _indexingCount = 0;
   /** 当前活跃的进度条取消源；索引被 cancelIndex 作废时主动取消。 */
   private _activeProgressCancel: vscode.CancellationTokenSource | null = null;
 
@@ -55,7 +55,7 @@ export class DatabaseManager {
 
   /** 是否有索引正在跑。 */
   isIndexing(): boolean {
-    return this._indexing;
+    return this._indexingCount > 0;
   }
 
   private _updateStorageFile(): void {
@@ -80,7 +80,7 @@ export class DatabaseManager {
     } else {
       (async () => {
         const gen = this.beginIndex();
-        this._indexing = true;
+        this._indexingCount++;
         const cts = new vscode.CancellationTokenSource();
         this._activeProgressCancel = cts;
         try {
@@ -141,7 +141,7 @@ export class DatabaseManager {
           this._progressItem.text = `$(error) 索引失败`;
           setTimeout(() => this._progressItem.hide(), 5000);
         } finally {
-          this._indexing = false;
+          this._indexingCount--;
           if (this._activeProgressCancel === cts) {
             this._activeProgressCancel = null;
           }
@@ -189,7 +189,7 @@ export class DatabaseManager {
   /** 全量重建索引 */
   async reindexAll(): Promise<void> {
     const gen = this.beginIndex();
-    this._indexing = true;
+    this._indexingCount++;
     const cts = new vscode.CancellationTokenSource();
     this._activeProgressCancel = cts;
     try {
@@ -246,7 +246,7 @@ export class DatabaseManager {
         await this._saveToDisk();
       });
     } finally {
-      this._indexing = false;
+      this._indexingCount--;
       if (this._activeProgressCancel === cts) {
         this._activeProgressCancel = null;
       }
@@ -259,7 +259,7 @@ export class DatabaseManager {
     if (this._reindexing) { return 0; }
     this._reindexing = true;
     const gen = this.beginIndex();
-    this._indexing = true;
+    this._indexingCount++;
     const cts = new vscode.CancellationTokenSource();
     this._activeProgressCancel = cts;
     try {
@@ -294,7 +294,7 @@ export class DatabaseManager {
       return count;
     } finally {
       this._reindexing = false;
-      this._indexing = false;
+      this._indexingCount--;
       if (this._activeProgressCancel === cts) {
         this._activeProgressCancel = null;
       }
