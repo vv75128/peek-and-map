@@ -409,8 +409,10 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     // 2. 作废搜索令牌
     this._searchGen++;
 
-    // 3. 取消正在跑的索引
-    this._dbManager.cancelIndex();
+    // 3. 取消正在跑的索引（只在有旧搜索时）
+    if (wasSearching) {
+      this._dbManager.cancelIndex();
+    }
 
     // 4. 清 LSP 结果缓存
     this._memberDefCache.clear();
@@ -419,8 +421,8 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
     // 5. 清重复点击去重
     this._lastSearchKey = null;
 
-    // 6. 只要上一次搜索还在跑（rg 或索引后处理），就触发 C/C++ 重扫
-    if (wasSearching) {
+    // 6. 触发 C/C++ 重扫（只在有旧搜索、且索引不在跑时）
+    if (wasSearching && !this._dbManager.isIndexing()) {
       try {
         await vscode.commands.executeCommand('C_Cpp.RescanWorkspace');
       } catch {
@@ -493,11 +495,12 @@ export class MapViewProvider implements vscode.WebviewViewProvider {
 
     // ★ 走到这里说明确实要做一次引用分析 —— 中断所有正在跑的旧操作。
     //   _abortAllInFlight 里已做 _searchGen++，因此本次搜索令牌取当前值。
-    // 只有在旧搜索还在跑时，才中断它
-    if (this._searchInFlight > 0 || this._activeRgAbort) {
+    //   但如果 Peek and Map 正在索引，跳过 _abortAllInFlight，避免打断索引。
+    if (this._dbManager.isIndexing()) {
+      this._searchGen++;
+    } else if (this._searchInFlight > 0 || this._activeRgAbort) {
       await this._abortAllInFlight();
     } else {
-      // 没有旧搜索，只作废令牌
       this._searchGen++;
     }
     const mySearchId = this._searchGen;
